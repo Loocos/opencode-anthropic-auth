@@ -1,4 +1,8 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { AccountStore } from '../accounts'
 import { AnthropicAuthPlugin } from '../index'
 
 /** Extract the URL string from a fetch input (string, URL, or Request). */
@@ -80,9 +84,9 @@ describe('AnthropicAuthPlugin', () => {
 })
 
 describe('auth.methods', () => {
-  test('has three auth methods', async () => {
+  test('has four auth methods', async () => {
     const plugin = await getPlugin()
-    expect(plugin.auth.methods).toHaveLength(3)
+    expect(plugin.auth.methods).toHaveLength(4)
   })
 
   test('first method is Claude Pro/Max OAuth with code flow', async () => {
@@ -93,17 +97,25 @@ describe('auth.methods', () => {
     expect(method.authorize).toBeFunction()
   })
 
-  test('second method is Create an API Key OAuth with code flow', async () => {
+  test('second method adds another Claude account for failover', async () => {
     const plugin = await getPlugin()
     const method = plugin.auth.methods[1]
+    expect(method.label).toBe('Add another Claude account (failover)')
+    expect(method.type).toBe('oauth')
+    expect(method.authorize).toBeFunction()
+  })
+
+  test('third method is Create an API Key OAuth with code flow', async () => {
+    const plugin = await getPlugin()
+    const method = plugin.auth.methods[2]
     expect(method.label).toBe('Create an API Key')
     expect(method.type).toBe('oauth')
     expect(method.authorize).toBeFunction()
   })
 
-  test('third method is manual API key', async () => {
+  test('fourth method is manual API key', async () => {
     const plugin = await getPlugin()
-    const method = plugin.auth.methods[2]
+    const method = plugin.auth.methods[3]
     expect(method.label).toBe('Manually enter API Key')
     expect(method.type).toBe('api')
     expect(method.provider).toBe('anthropic')
@@ -623,5 +635,176 @@ describe('provider hook', () => {
     // Should keep the existing entry, not overwrite it
     expect((result['claude-opus-4-7'] as any).custom).toBe(true)
     expect(result['claude-opus-4-7'].name).toBe('Existing Opus 4.7')
+  })
+})
+
+describe('multi-account failover', () => {
+  const originalFetch = globalThis.fetch
+  const originalAccountsPath = process.env.ANTHROPIC_ACCOUNTS_PATH
+  let dir: string
+  let storePath: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'failover-test-'))
+    storePath = join(dir, 'accounts.json')
+    process.env.ANTHROPIC_ACCOUNTS_PATH = storePath
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    if (originalAccountsPath === undefined) {
+      delete process.env.ANTHROPIC_ACCOUNTS_PATH
+    } else {
+      process.env.ANTHROPIC_ACCOUNTS_PATH = originalAccountsPath
+    }
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  /** A primary OAuth credential with a valid (non-expired) token. */
+  function primaryAuth() {
+    return {
+      type: 'oauth' as const,
+      access: 'primary-access',
+      refresh: 'primary-refresh',
+      expires: Date.now() + 100_000,
+    }
+  }
+
+  test('falls over to a second account on 429 and marks cooldown', async () => {
+    // Seed a second account in the store.
+    const store = new AccountStore(storePath)
+    const second = store.add({
+      refresh: 'second-refresh',
+      access: 'second-access',
+      expires: Date.now() + 100_000,
+      label: 'Second',
+    })
+
+    const authHeaders: string[] = []
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/messages')) {
+        const auth = (init?.headers as Headers).get('authorization') ?? ''
+        authHeaders.push(auth)
+        // First account (primary) is rate-limited, second succeeds.
+        if (auth.includes('primary-access')) {
+          return Promise.resolve(
+            new Response('rate limited', {
+              status: 429,
+              headers: { 'retry-after': '120' },
+            }),
+          )
+        }
+        return Promise.resolve(new Response(null, { status: 200 }))
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () => Promise.resolve(primaryAuth()),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(response.status).toBe(200)
+
+    // Both the primary and the second account were attempted, in order.
+    expect(authHeaders[0]).toContain('primary-access')
+    expect(authHeaders[1]).toContain('second-access')
+
+    // The rate-limited account (matched by refresh) should now be cooling down.
+    // Primary isn't in the store, so only the second remains available.
+    const now = Date.now()
+    const available = store.available(now)
+    expect(available.map((a) => a.id)).toContain(second.id)
+  })
+
+  test('returns the last error response when all accounts are exhausted', async () => {
+    // Primary + one store account, both rate-limited.
+    const store = new AccountStore(storePath)
+    store.add({
+      refresh: 'second-refresh',
+      access: 'second-access',
+      expires: Date.now() + 100_000,
+    })
+
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/messages')) {
+        return Promise.resolve(new Response('nope', { status: 429 }))
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () => Promise.resolve(primaryAuth()),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    // All exhausted → surfaces the real 429 to the caller.
+    expect(response.status).toBe(429)
+  })
+
+  test('does not fail over on a successful primary request', async () => {
+    const store = new AccountStore(storePath)
+    store.add({
+      refresh: 'second-refresh',
+      access: 'second-access',
+      expires: Date.now() + 100_000,
+    })
+
+    let messagesCalls = 0
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/messages')) {
+        messagesCalls += 1
+        return Promise.resolve(new Response(null, { status: 200 }))
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () => Promise.resolve(primaryAuth()),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(response.status).toBe(200)
+    // Only the primary should have been hit.
+    expect(messagesCalls).toBe(1)
+  })
+
+  test('skips store accounts that are cooling down', async () => {
+    const store = new AccountStore(storePath)
+    const cooling = store.add({
+      refresh: 'cooling-refresh',
+      access: 'cooling-access',
+      expires: Date.now() + 100_000,
+    })
+    store.markCooldown(cooling.id, Date.now() + 100_000, 'HTTP 429')
+
+    const authHeaders: string[] = []
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/messages')) {
+        authHeaders.push((init?.headers as Headers).get('authorization') ?? '')
+        return Promise.resolve(new Response(null, { status: 200 }))
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () => Promise.resolve(primaryAuth()),
+      { models: {} },
+    )
+
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+    // Cooling account must not be attempted.
+    expect(authHeaders.some((h) => h.includes('cooling-access'))).toBe(false)
   })
 })

@@ -1,4 +1,15 @@
-# @ex-machina/opencode-anthropic-auth
+# opencode-anthropic-auth-loocos
+
+> Forked from [`@ex-machina/opencode-anthropic-auth`](https://github.com/ex-machina-co/opencode-anthropic-auth).
+> Entries below version 1.9.0 are from the upstream project.
+
+## 1.9.0
+
+### Minor Changes
+
+- Add multiple Claude account support with automatic failover. You can now authenticate several Claude Pro/Max accounts via a new "Add another Claude account (failover)" auth method; extra accounts are stored in a plugin-owned `accounts.json` (path overridable via `ANTHROPIC_ACCOUNTS_PATH`). When a request hits a rate limit / usage limit / auth error (`429`, `401`, `403`, `529`), the plugin transparently retries it on the next available account and puts the exhausted account on a cooldown (respecting `Retry-After`), only surfacing an error once every account is exhausted.
+
+- Add Claude Opus 4.7 to the model selection list via a new `provider` hook. The plugin now injects `claude-opus-4-7` into the Anthropic provider's model map if it's not already present in OpenCode's bundled models.dev snapshot, so users can select the newly released model without waiting for an OpenCode update.
 
 ## 1.7.3
 

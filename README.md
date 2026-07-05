@@ -2,6 +2,12 @@
 
 An [OpenCode](https://github.com/anomalyco/opencode) plugin that provides Anthropic OAuth authentication, enabling Claude Pro/Max users to use their subscription directly with OpenCode.
 
+> [!NOTE]
+> This package (`opencode-anthropic-auth-loocos`) is a fork of the upstream
+> [`@ex-machina/opencode-anthropic-auth`](https://github.com/ex-machina-co/opencode-anthropic-auth)
+> that adds **multiple-account support with automatic failover**. It is published
+> independently and is not affiliated with the upstream maintainers.
+
 > [!IMPORTANT]
 > If you are seeing issues, please try to `rm -rf ~/.cache/opencode` and check your `opencode.json` config to make sure you're on the latest version.
 >
@@ -13,7 +19,7 @@ Add the plugin to your OpenCode configuration:
 
 ```json
 {
-  "plugin": ["@ex-machina/opencode-anthropic-auth"]
+  "plugin": ["opencode-anthropic-auth-loocos"]
 }
 ```
 
@@ -26,17 +32,60 @@ Add the plugin to your OpenCode configuration:
 
 ```json
 {
-  "plugin": ["@ex-machina/opencode-anthropic-auth@1.7.3"]
+  "plugin": ["opencode-anthropic-auth-loocos@1.9.0"]
 }
 ```
 
 ## Authentication Methods
 
-The plugin provides three authentication options:
+The plugin provides four authentication options:
 
 - **Claude Pro/Max** - OAuth flow via `claude.ai` for Pro/Max subscribers. Uses your existing subscription at no additional API cost.
+- **Add another Claude account (failover)** - OAuth flow to register an additional Claude account for automatic failover (see below).
 - **Create an API Key** - OAuth flow via `console.anthropic.com` that creates an API key on your behalf.
 - **Manually enter API Key** - Standard API key entry for users who already have one.
+
+## Multiple Accounts & Automatic Failover
+
+You can authenticate multiple Claude Pro/Max accounts and have the plugin
+automatically switch between them when one runs out of usage.
+
+### Adding accounts
+
+1. Sign in normally via **Claude Pro/Max** (this becomes your primary account).
+2. To add more accounts, choose **Add another Claude account (failover)** and
+   complete the OAuth flow while logged into a *different* Claude account. Repeat
+   for as many accounts as you want.
+
+### How failover works
+
+On every request the plugin builds an ordered list of candidate accounts and
+tries them in turn:
+
+1. Your primary (OpenCode) account first.
+2. Then each additional account that isn't currently cooling down.
+
+If a request returns a rate-limit / usage-limit / auth error (`429`, `401`,
+`403`, or `529`), that account is put on a cooldown (respecting any
+`Retry-After` header) and the same request is transparently retried on the next
+available account. An error is only surfaced to you once **every** account is
+exhausted.
+
+Access tokens are refreshed per account, and rotated refresh tokens are
+persisted automatically. Cooldowns expire on their own, so an account becomes
+available again after its rate-limit window passes.
+
+### Where accounts are stored
+
+Additional accounts are stored in a plugin-owned JSON file (mode `0600`):
+
+- `$ANTHROPIC_ACCOUNTS_PATH` if set, otherwise
+- `$XDG_DATA_HOME/opencode-anthropic-auth/accounts.json`, otherwise
+- `~/.local/share/opencode-anthropic-auth/accounts.json`
+
+To remove an account, delete its entry from that file (or delete the file to
+reset all extra accounts). Your primary account continues to be managed by
+OpenCode's own credential store.
 
 ## Configuration
 
@@ -46,6 +95,7 @@ The plugin supports the following environment variables:
 |-----------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `ANTHROPIC_BASE_URL`              | Override the API endpoint URL (e.g. for proxying). Must be a valid HTTP(S) URL.                                                                                                             |
 | `ANTHROPIC_INSECURE`              | Set to `1` or `true` to skip TLS certificate verification. Only effective when `ANTHROPIC_BASE_URL` is also set.                                                                            |
+| `ANTHROPIC_ACCOUNTS_PATH`         | Override the path to the multi-account store file. Defaults to `$XDG_DATA_HOME/opencode-anthropic-auth/accounts.json` (or `~/.local/share/...`).                                            |
 
 ## How It Works
 
@@ -53,10 +103,12 @@ For Claude Pro/Max authentication, the plugin:
 
 1. Initiates a PKCE OAuth flow against Anthropic's authorization endpoint
 2. Exchanges the authorization code for access and refresh tokens
-3. Automatically refreshes expired tokens
+3. Automatically refreshes expired tokens (per account)
 4. Injects the required OAuth headers and beta flags into API requests
 5. Sanitizes the system prompt for compatibility (see below)
 6. Zeros out model costs (since usage is covered by the subscription)
+7. Automatically fails over to another authenticated account when one is
+   rate-limited or exhausted (see [Multiple Accounts & Automatic Failover](#multiple-accounts--automatic-failover))
 
 ### System Prompt Sanitization
 

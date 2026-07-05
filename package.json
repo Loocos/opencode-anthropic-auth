@@ -1,9 +1,9 @@
 {
-  "name": "@ex-machina/opencode-anthropic-auth",
-  "version": "1.7.3",
+  "name": "opencode-anthropic-auth-loocos",
+  "version": "1.9.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ex-machina-co/opencode-anthropic-auth"
+    "url": "git+https://github.com/Loocos/opencode-anthropic-auth.git"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

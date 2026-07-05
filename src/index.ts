@@ -1,6 +1,11 @@
 import type { Plugin } from '@opencode-ai/plugin'
+import {
+  AccountStore,
+  computeCooldownUntil,
+  isFailoverStatus,
+} from './accounts.ts'
 import { authorize, exchange } from './auth.ts'
-import { CLIENT_ID, TOKEN_URL } from './constants.ts'
+import { refreshAccessToken } from './refresh.ts'
 import {
   createStrippedStream,
   isInsecure,
@@ -93,122 +98,195 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
             }
           }
 
-          // Shared inflight refresh promise — prevents concurrent token refreshes
-          // from racing against each other (and causing 401 cascades with token rotation)
-          let refreshPromise: Promise<string> | null = null
+          const store = new AccountStore()
+
+          // Per-account inflight refresh promises — prevents concurrent token
+          // refreshes for the same account from racing (and causing 401
+          // cascades under refresh-token rotation). Keyed by account id.
+          const refreshPromises = new Map<string, Promise<string>>()
+
+          /**
+           * The "primary" account is OpenCode's own `anthropic` credential.
+           * We keep it as the first candidate for backward compatibility and
+           * mirror any token rotation back to OpenCode via `client.auth.set`.
+           */
+          const PRIMARY_ID = '__opencode_primary__'
+
+          /**
+           * Persist rotated tokens: for the primary account write back to
+           * OpenCode, otherwise update the plugin-owned account store.
+           */
+          async function persistTokens(
+            id: string,
+            tokens: { refresh: string; access: string; expires: number },
+          ) {
+            if (id === PRIMARY_ID) {
+              // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
+              await (client as any).auth.set({
+                path: { id: 'anthropic' },
+                body: { type: 'oauth', ...tokens },
+              })
+            } else {
+              store.updateTokens(id, tokens)
+            }
+          }
+
+          /**
+           * Ensure a candidate has a valid (non-expired) access token,
+           * refreshing if necessary. Deduplicates concurrent refreshes per id.
+           */
+          async function ensureFreshAccess(candidate: {
+            id: string
+            refresh: string
+            access: string
+            expires: number
+          }): Promise<string> {
+            if (
+              candidate.access &&
+              candidate.expires &&
+              candidate.expires >= Date.now()
+            ) {
+              return candidate.access
+            }
+
+            let inflight = refreshPromises.get(candidate.id)
+            if (!inflight) {
+              inflight = (async () => {
+                const tokens = await refreshAccessToken(candidate.refresh)
+                await persistTokens(candidate.id, tokens)
+                return tokens.access
+              })().finally(() => {
+                refreshPromises.delete(candidate.id)
+              })
+              refreshPromises.set(candidate.id, inflight)
+            }
+            return inflight
+          }
+
+          /** Build the ordered list of candidate accounts to try. */
+          function buildCandidates(current: {
+            refresh?: string
+            access?: string
+            expires?: number
+          }): Array<{
+            id: string
+            refresh: string
+            access: string
+            expires: number
+          }> {
+            const candidates: Array<{
+              id: string
+              refresh: string
+              access: string
+              expires: number
+            }> = []
+
+            if (current.refresh) {
+              candidates.push({
+                id: PRIMARY_ID,
+                refresh: current.refresh,
+                access: current.access ?? '',
+                expires: current.expires ?? 0,
+              })
+            }
+
+            // Append available (not cooling-down) store accounts, skipping any
+            // that duplicate the primary refresh token.
+            for (const account of store.available()) {
+              if (account.refresh === current.refresh) continue
+              candidates.push({
+                id: account.id,
+                refresh: account.refresh,
+                access: account.access,
+                expires: account.expires,
+              })
+            }
+
+            return candidates
+          }
 
           return {
             apiKey: '',
             async fetch(input: string | URL | Request, init?: RequestInit) {
-              const auth = await getAuth()
-              if (auth.type !== 'oauth') return fetch(input, init)
-              if (!auth.access || !auth.expires || auth.expires < Date.now()) {
-                if (!refreshPromise) {
-                  refreshPromise = (async () => {
-                    const maxRetries = 2
-                    const baseDelayMs = 500
+              const current = await getAuth()
+              if (current.type !== 'oauth') return fetch(input, init)
 
-                    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-                      try {
-                        if (attempt > 0) {
-                          const delay = baseDelayMs * 2 ** (attempt - 1)
-                          await new Promise((resolve) =>
-                            setTimeout(resolve, delay),
-                          )
-                        }
-
-                        const response = await fetch(TOKEN_URL, {
-                          method: 'POST',
-                          headers: {
-                            'Content-Type': 'application/json',
-                            Accept: 'application/json, text/plain, */*',
-                            'User-Agent': 'axios/1.13.6',
-                          },
-                          body: JSON.stringify({
-                            grant_type: 'refresh_token',
-                            refresh_token: auth.refresh,
-                            client_id: CLIENT_ID,
-                          }),
-                        })
-
-                        if (!response.ok) {
-                          if (response.status >= 500 && attempt < maxRetries) {
-                            await response.body?.cancel()
-                            continue
-                          }
-
-                          const body = await response.text().catch(() => '')
-                          throw new Error(
-                            `Token refresh failed: ${response.status} — ${body}`,
-                          )
-                        }
-
-                        const json = (await response.json()) as {
-                          refresh_token: string
-                          access_token: string
-                          expires_in: number
-                        }
-
-                        // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
-                        await (client as any).auth.set({
-                          path: {
-                            id: 'anthropic',
-                          },
-                          body: {
-                            type: 'oauth',
-                            refresh: json.refresh_token,
-                            access: json.access_token,
-                            expires: Date.now() + json.expires_in * 1000,
-                          },
-                        })
-
-                        return json.access_token
-                      } catch (error) {
-                        const isNetworkError =
-                          error instanceof Error &&
-                          (error.message.includes('fetch failed') ||
-                            ('code' in error &&
-                              (error.code === 'ECONNRESET' ||
-                                error.code === 'ECONNREFUSED' ||
-                                error.code === 'ETIMEDOUT' ||
-                                error.code === 'UND_ERR_CONNECT_TIMEOUT')))
-
-                        if (attempt < maxRetries && isNetworkError) {
-                          continue
-                        }
-
-                        throw error
-                      }
-                    }
-                    // Unreachable — each iteration either returns or throws.
-                    // Kept as a TypeScript exhaustiveness guard.
-                    throw new Error('Token refresh exhausted all retries')
-                  })().finally(() => {
-                    refreshPromise = null
-                  })
-                }
-                auth.access = await refreshPromise
-              }
-
-              const requestHeaders = mergeHeaders(input, init)
-              // biome-ignore lint/style/noNonNullAssertion: access is guaranteed set above
-              setOAuthHeaders(requestHeaders, auth.access!)
+              const candidates = buildCandidates(current)
 
               let body = init?.body
               if (body && typeof body === 'string') {
                 body = rewriteRequestBody(body)
               }
-
               const rewritten = rewriteUrl(input)
 
-              const response = await fetch(rewritten.input, {
+              let lastResponse: Response | undefined
+              let lastError: unknown
+
+              for (let i = 0; i < candidates.length; i++) {
+                const candidate = candidates[i]
+                if (!candidate) continue
+                const isLast = i === candidates.length - 1
+
+                let access: string
+                try {
+                  access = await ensureFreshAccess(candidate)
+                } catch (error) {
+                  // Refresh failed (e.g. invalidated refresh token). Cool down
+                  // non-primary accounts and try the next candidate.
+                  lastError = error
+                  if (candidate.id !== PRIMARY_ID) {
+                    store.markCooldown(
+                      candidate.id,
+                      Date.now() + 5 * 60_000,
+                      error instanceof Error ? error.message : String(error),
+                    )
+                  }
+                  if (isLast) throw error
+                  continue
+                }
+
+                const requestHeaders = mergeHeaders(input, init)
+                setOAuthHeaders(requestHeaders, access)
+
+                const response = await fetch(rewritten.input, {
+                  ...init,
+                  body,
+                  headers: requestHeaders,
+                  ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
+                })
+
+                if (isFailoverStatus(response.status) && !isLast) {
+                  // Account is rate-limited / usage-limited / rejected. Record a
+                  // cooldown (respecting retry-after) and try the next account.
+                  const until = computeCooldownUntil(
+                    response.headers.get('retry-after'),
+                  )
+                  if (candidate.id !== PRIMARY_ID) {
+                    store.markCooldown(
+                      candidate.id,
+                      until,
+                      `HTTP ${response.status}`,
+                    )
+                  }
+                  await response.body?.cancel()
+                  lastResponse = response
+                  continue
+                }
+
+                return createStrippedStream(response)
+              }
+
+              // All candidates exhausted — surface the last real response so the
+              // user sees the actual API error, or rethrow the last error.
+              if (lastResponse) return createStrippedStream(lastResponse)
+              if (lastError) throw lastError
+              // No candidates at all (no refresh token) — fall back to a plain
+              // pass-through so behavior matches the single-account baseline.
+              return fetch(rewritten.input, {
                 ...init,
                 body,
-                headers: requestHeaders,
                 ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
               })
-
-              return createStrippedStream(response)
             },
           }
         }
@@ -226,12 +304,62 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
               instructions: 'Paste the authorization code here:',
               method: 'code',
               callback: async (code: string) => {
-                return exchange(
+                const credentials = await exchange(
                   code,
                   result.verifier,
                   result.redirectUri,
                   result.state,
                 )
+                // Mirror the login into the plugin-owned account store so it
+                // participates in automatic failover alongside any extra
+                // accounts. Deduped by refresh token.
+                if (credentials.type === 'success') {
+                  try {
+                    new AccountStore().add({
+                      refresh: credentials.refresh,
+                      access: credentials.access,
+                      expires: credentials.expires,
+                    })
+                  } catch {
+                    // Store failure must never block a successful login.
+                  }
+                }
+                return credentials
+              },
+            }
+          },
+        },
+        {
+          label: 'Add another Claude account (failover)',
+          type: 'oauth',
+          authorize: async () => {
+            const result = await authorize('max')
+            return {
+              url: result.url,
+              instructions:
+                'Log in with a DIFFERENT Claude account, then paste the code here:',
+              method: 'code',
+              callback: async (code: string) => {
+                const credentials = await exchange(
+                  code,
+                  result.verifier,
+                  result.redirectUri,
+                  result.state,
+                )
+                if (credentials.type === 'success') {
+                  try {
+                    new AccountStore().add({
+                      refresh: credentials.refresh,
+                      access: credentials.access,
+                      expires: credentials.expires,
+                    })
+                  } catch {
+                    // Store failure must never block a successful login.
+                  }
+                }
+                // Returning success also refreshes OpenCode's primary slot to
+                // this account; the store dedupes so no account is used twice.
+                return credentials
               },
             }
           },
