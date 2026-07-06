@@ -3,6 +3,12 @@
 > Forked from [`@ex-machina/opencode-anthropic-auth`](https://github.com/ex-machina-co/opencode-anthropic-auth).
 > Entries below version 1.9.0 are from the upstream project.
 
+## 1.9.1
+
+### Patch Changes
+
+- Fix failover not triggering for Claude Pro/Max usage limits. Anthropic often returns **HTTP 200 with an `error` event inside the SSE stream** (e.g. `rate_limit_error`) rather than a `429` status, so the previous status-only check never failed over. The plugin now peeks at the start of the response stream and fails over when it detects a rate-limit / usage-limit / overloaded / auth error in the body (SSE or JSON), in addition to the HTTP `429/401/403/529` statuses. Dead refresh tokens now cool down for 1 hour instead of retrying every 5 minutes. Added an opt-in `ANTHROPIC_FAILOVER_DEBUG=1` env var that logs candidate selection and failover decisions to stderr.
+
 ## 1.9.0
 
 ### Minor Changes

@@ -1,10 +1,12 @@
 import type { Plugin } from '@opencode-ai/plugin'
-import {
-  AccountStore,
-  computeCooldownUntil,
-  isFailoverStatus,
-} from './accounts.ts'
+import { AccountStore, computeCooldownUntil } from './accounts.ts'
 import { authorize, exchange } from './auth.ts'
+import {
+  debugLog,
+  isFailoverStatus,
+  peekBody,
+  textIndicatesFailover,
+} from './failover.ts'
 import { refreshAccessToken } from './refresh.ts'
 import {
   createStrippedStream,
@@ -205,6 +207,22 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
             return candidates
           }
 
+          /**
+           * Put a candidate on cooldown so it's skipped next time. The primary
+           * (OpenCode) account isn't in the store, so we can't persist a
+           * cooldown for it — but it's always tried first anyway, so failover to
+           * the store accounts still happens within a single request.
+           */
+          function markFailover(
+            candidate: { id: string },
+            until: number,
+            reason: string,
+          ) {
+            if (candidate.id !== PRIMARY_ID) {
+              store.markCooldown(candidate.id, until, reason)
+            }
+          }
+
           return {
             apiKey: '',
             async fetch(input: string | URL | Request, init?: RequestInit) {
@@ -212,6 +230,12 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
               if (current.type !== 'oauth') return fetch(input, init)
 
               const candidates = buildCandidates(current)
+              debugLog(
+                `request: ${candidates.length} candidate account(s)`,
+                candidates.map((c) =>
+                  c.id === PRIMARY_ID ? 'primary' : c.id.slice(0, 8),
+                ),
+              )
 
               let body = init?.body
               if (body && typeof body === 'string') {
@@ -226,6 +250,10 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                 const candidate = candidates[i]
                 if (!candidate) continue
                 const isLast = i === candidates.length - 1
+                const tag =
+                  candidate.id === PRIMARY_ID
+                    ? 'primary'
+                    : candidate.id.slice(0, 8)
 
                 let access: string
                 try {
@@ -234,13 +262,12 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                   // Refresh failed (e.g. invalidated refresh token). Cool down
                   // non-primary accounts and try the next candidate.
                   lastError = error
-                  if (candidate.id !== PRIMARY_ID) {
-                    store.markCooldown(
-                      candidate.id,
-                      Date.now() + 5 * 60_000,
-                      error instanceof Error ? error.message : String(error),
-                    )
-                  }
+                  const reason =
+                    error instanceof Error ? error.message : String(error)
+                  // A dead refresh token won't recover for a long time — cool it
+                  // down for an hour rather than churning every 5 minutes.
+                  markFailover(candidate, Date.now() + 60 * 60_000, reason)
+                  debugLog(`account ${tag}: refresh failed → ${reason}`)
                   if (isLast) throw error
                   continue
                 }
@@ -255,24 +282,63 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                   ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
                 })
 
-                if (isFailoverStatus(response.status) && !isLast) {
-                  // Account is rate-limited / usage-limited / rejected. Record a
-                  // cooldown (respecting retry-after) and try the next account.
+                // Case 1: a hard failover HTTP status (429/401/403/529).
+                if (isFailoverStatus(response.status)) {
                   const until = computeCooldownUntil(
                     response.headers.get('retry-after'),
                   )
-                  if (candidate.id !== PRIMARY_ID) {
-                    store.markCooldown(
-                      candidate.id,
-                      until,
-                      `HTTP ${response.status}`,
-                    )
+                  markFailover(candidate, until, `HTTP ${response.status}`)
+                  debugLog(
+                    `account ${tag}: HTTP ${response.status} → failover`,
+                    isLast ? '(no more accounts)' : '',
+                  )
+                  if (isLast) {
+                    lastResponse = response
+                    break
                   }
                   await response.body?.cancel()
-                  lastResponse = response
                   continue
                 }
 
+                // Case 2: a 2xx response whose stream/body actually carries an
+                // error event (Anthropic often returns 200 + an SSE `error`
+                // event for rate/usage limits). Peek the body to detect this
+                // without discarding the data for the good case.
+                if (response.body) {
+                  const { prefixText, stream } = await peekBody(response.body)
+                  if (textIndicatesFailover(prefixText)) {
+                    markFailover(
+                      candidate,
+                      computeCooldownUntil(response.headers.get('retry-after')),
+                      'stream error (rate/usage limit)',
+                    )
+                    debugLog(
+                      `account ${tag}: stream error → failover`,
+                      isLast ? '(no more accounts)' : '',
+                      prefixText.slice(0, 200),
+                    )
+                    if (isLast) {
+                      lastResponse = new Response(stream, {
+                        status: response.status,
+                        statusText: response.statusText,
+                        headers: response.headers,
+                      })
+                      break
+                    }
+                    await stream.cancel().catch(() => {})
+                    continue
+                  }
+
+                  debugLog(`account ${tag}: OK`)
+                  const rebuilt = new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers,
+                  })
+                  return createStrippedStream(rebuilt)
+                }
+
+                debugLog(`account ${tag}: OK (no body)`)
                 return createStrippedStream(response)
               }
 

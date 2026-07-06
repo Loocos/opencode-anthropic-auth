@@ -2,11 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import {
-  AccountStore,
-  computeCooldownUntil,
-  isFailoverStatus,
-} from '../accounts'
+import { AccountStore, computeCooldownUntil } from '../accounts'
+import { isFailoverStatus } from '../failover'
 
 let dir: string
 let storePath: string

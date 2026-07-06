@@ -32,7 +32,7 @@ Add the plugin to your OpenCode configuration:
 
 ```json
 {
-  "plugin": ["opencode-anthropic-auth-loocos@1.9.0"]
+  "plugin": ["opencode-anthropic-auth-loocos@1.9.1"]
 }
 ```
 
@@ -65,15 +65,36 @@ tries them in turn:
 1. Your primary (OpenCode) account first.
 2. Then each additional account that isn't currently cooling down.
 
-If a request returns a rate-limit / usage-limit / auth error (`429`, `401`,
-`403`, or `529`), that account is put on a cooldown (respecting any
-`Retry-After` header) and the same request is transparently retried on the next
-available account. An error is only surfaced to you once **every** account is
-exhausted.
+Failover triggers when a request fails in any of these ways:
+
+- An HTTP error status: `429` (rate limit), `401`/`403` (auth), or `529`
+  (overloaded).
+- **An error *inside* a `200 OK` streaming response.** Claude Pro/Max usage
+  limits frequently come back as HTTP 200 with an `error` event in the SSE
+  stream (e.g. `rate_limit_error`), not as a `429`. The plugin peeks at the
+  start of the stream and fails over in this case too — this is the common
+  "my account got restricted" scenario.
+
+The exhausted account is put on a cooldown (respecting any `Retry-After`
+header) and the same request is transparently retried on the next available
+account. An error is only surfaced to you once **every** account is exhausted.
 
 Access tokens are refreshed per account, and rotated refresh tokens are
 persisted automatically. Cooldowns expire on their own, so an account becomes
-available again after its rate-limit window passes.
+available again after its rate-limit window passes. An account whose refresh
+token is permanently invalid (e.g. logged out elsewhere) is cooled down for an
+hour so it stops being retried on every request.
+
+### Debugging failover
+
+Set `ANTHROPIC_FAILOVER_DEBUG=1` to log candidate selection and failover
+decisions to stderr, e.g.:
+
+```
+[anthropic-failover] request: 3 candidate account(s) [ 'primary', 'd88cbd5a', 'd5189abb' ]
+[anthropic-failover] account primary: stream error → failover
+[anthropic-failover] account d88cbd5a: OK
+```
 
 ### Where accounts are stored
 
@@ -96,6 +117,7 @@ The plugin supports the following environment variables:
 | `ANTHROPIC_BASE_URL`              | Override the API endpoint URL (e.g. for proxying). Must be a valid HTTP(S) URL.                                                                                                             |
 | `ANTHROPIC_INSECURE`              | Set to `1` or `true` to skip TLS certificate verification. Only effective when `ANTHROPIC_BASE_URL` is also set.                                                                            |
 | `ANTHROPIC_ACCOUNTS_PATH`         | Override the path to the multi-account store file. Defaults to `$XDG_DATA_HOME/opencode-anthropic-auth/accounts.json` (or `~/.local/share/...`).                                            |
+| `ANTHROPIC_FAILOVER_DEBUG`        | Set to `1` or `true` to log multi-account candidate selection and failover decisions to stderr.                                                                                             |
 
 ## How It Works
 

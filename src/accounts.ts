@@ -225,15 +225,3 @@ export function computeCooldownUntil(
   }
   return now + defaultMs
 }
-
-/**
- * Decide whether an Anthropic API response status indicates the current
- * account is exhausted and we should fail over to another account.
- *
- * - 429: rate limit / usage limit
- * - 401/403: auth rejected (token invalid, subscription issue)
- * - 529: Anthropic "overloaded" (treated as transient exhaustion)
- */
-export function isFailoverStatus(status: number): boolean {
-  return status === 429 || status === 401 || status === 403 || status === 529
-}

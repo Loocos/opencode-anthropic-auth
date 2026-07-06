@@ -1,9 +1,37 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  test,
+} from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AccountStore } from '../accounts'
 import { AnthropicAuthPlugin } from '../index'
+
+// Isolate the account store for the WHOLE file so no test ever reads the real
+// user store at ~/.local/share/opencode-anthropic-auth/accounts.json.
+let globalStoreDir: string
+const originalGlobalAccountsPath = process.env.ANTHROPIC_ACCOUNTS_PATH
+
+beforeAll(() => {
+  globalStoreDir = mkdtempSync(join(tmpdir(), 'accounts-global-'))
+  process.env.ANTHROPIC_ACCOUNTS_PATH = join(globalStoreDir, 'accounts.json')
+})
+
+afterAll(() => {
+  if (originalGlobalAccountsPath === undefined) {
+    delete process.env.ANTHROPIC_ACCOUNTS_PATH
+  } else {
+    process.env.ANTHROPIC_ACCOUNTS_PATH = originalGlobalAccountsPath
+  }
+  rmSync(globalStoreDir, { recursive: true, force: true })
+})
 
 /** Extract the URL string from a fetch input (string, URL, or Request). */
 function extractUrl(input: string | URL | Request): string {
@@ -640,7 +668,6 @@ describe('provider hook', () => {
 
 describe('multi-account failover', () => {
   const originalFetch = globalThis.fetch
-  const originalAccountsPath = process.env.ANTHROPIC_ACCOUNTS_PATH
   let dir: string
   let storePath: string
 
@@ -652,11 +679,9 @@ describe('multi-account failover', () => {
 
   afterEach(() => {
     globalThis.fetch = originalFetch
-    if (originalAccountsPath === undefined) {
-      delete process.env.ANTHROPIC_ACCOUNTS_PATH
-    } else {
-      process.env.ANTHROPIC_ACCOUNTS_PATH = originalAccountsPath
-    }
+    // Restore to the file-wide isolated store (set in the top-level beforeAll),
+    // never to the real user store.
+    process.env.ANTHROPIC_ACCOUNTS_PATH = join(globalStoreDir, 'accounts.json')
     rmSync(dir, { recursive: true, force: true })
   })
 
@@ -806,5 +831,107 @@ describe('multi-account failover', () => {
     await result.fetch(MESSAGES_URL, EMPTY_POST)
     // Cooling account must not be attempted.
     expect(authHeaders.some((h) => h.includes('cooling-access'))).toBe(false)
+  })
+
+  test('fails over when a 200 response carries an SSE error event', async () => {
+    // This is the real-world Claude Max case: HTTP 200 but the stream's first
+    // event is a rate_limit_error.
+    const store = new AccountStore(storePath)
+    store.add({
+      refresh: 'second-refresh',
+      access: 'second-access',
+      expires: Date.now() + 100_000,
+    })
+
+    const encoder = new TextEncoder()
+    const authHeaders: string[] = []
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/messages')) {
+        const auth = (init?.headers as Headers).get('authorization') ?? ''
+        authHeaders.push(auth)
+        if (auth.includes('primary-access')) {
+          // 200 OK, but an error event in the stream.
+          const stream = new ReadableStream({
+            start(controller) {
+              controller.enqueue(
+                encoder.encode(
+                  'event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"usage limit exceeded"}}\n\n',
+                ),
+              )
+              controller.close()
+            },
+          })
+          return Promise.resolve(new Response(stream, { status: 200 }))
+        }
+        // Second account: a normal successful stream.
+        const ok = new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              encoder.encode(
+                'event: message_start\ndata: {"type":"message_start"}\n\n',
+              ),
+            )
+            controller.close()
+          },
+        })
+        return Promise.resolve(new Response(ok, { status: 200 }))
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () => Promise.resolve(primaryAuth()),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    const text = await response.text()
+
+    // Should have advanced to the second account and returned its good stream.
+    expect(authHeaders[0]).toContain('primary-access')
+    expect(authHeaders[1]).toContain('second-access')
+    expect(text).toContain('message_start')
+    expect(text).not.toContain('rate_limit_error')
+  })
+
+  test('passes through a normal 200 SSE stream unchanged (peek+replay)', async () => {
+    const encoder = new TextEncoder()
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/messages')) {
+        const ok = new ReadableStream({
+          start(controller) {
+            controller.enqueue(
+              encoder.encode(
+                'event: message_start\ndata: {"type":"message_start"}\n\n',
+              ),
+            )
+            controller.enqueue(
+              encoder.encode(
+                'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"hello"}}\n\n',
+              ),
+            )
+            controller.close()
+          },
+        })
+        return Promise.resolve(new Response(ok, { status: 200 }))
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () => Promise.resolve(primaryAuth()),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    const text = await response.text()
+    // Both events must be present and intact.
+    expect(text).toContain('message_start')
+    expect(text).toContain('content_block_delta')
+    expect(text).toContain('hello')
   })
 })
