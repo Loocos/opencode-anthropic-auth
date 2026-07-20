@@ -1,12 +1,7 @@
 import type { Plugin } from '@opencode-ai/plugin'
 import { AccountStore, computeCooldownUntil } from './accounts.ts'
 import { authorize, exchange } from './auth.ts'
-import {
-  debugLog,
-  isFailoverStatus,
-  peekBody,
-  textIndicatesFailover,
-} from './failover.ts'
+import { debugLog, inspectStream, isFailoverStatus } from './failover.ts'
 import { refreshAccessToken } from './refresh.ts'
 import {
   createStrippedStream,
@@ -102,10 +97,12 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
 
           const store = new AccountStore()
 
+          type Tokens = { access: string; refresh: string; expires: number }
+
           // Per-account inflight refresh promises — prevents concurrent token
           // refreshes for the same account from racing (and causing 401
           // cascades under refresh-token rotation). Keyed by account id.
-          const refreshPromises = new Map<string, Promise<string>>()
+          const refreshPromises = new Map<string, Promise<Tokens>>()
 
           /**
            * The "primary" account is OpenCode's own `anthropic` credential.
@@ -134,21 +131,26 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
           }
 
           /**
-           * Ensure a candidate has a valid (non-expired) access token,
-           * refreshing if necessary. Deduplicates concurrent refreshes per id.
+           * Ensure a candidate has a valid (non-expired) token set, refreshing
+           * if necessary. Deduplicates concurrent refreshes per id. Returns the
+           * full token set so a working account can be promoted to primary.
            */
-          async function ensureFreshAccess(candidate: {
+          async function ensureFreshTokens(candidate: {
             id: string
             refresh: string
             access: string
             expires: number
-          }): Promise<string> {
+          }): Promise<Tokens> {
             if (
               candidate.access &&
               candidate.expires &&
               candidate.expires >= Date.now()
             ) {
-              return candidate.access
+              return {
+                access: candidate.access,
+                refresh: candidate.refresh,
+                expires: candidate.expires,
+              }
             }
 
             let inflight = refreshPromises.get(candidate.id)
@@ -156,7 +158,7 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
               inflight = (async () => {
                 const tokens = await refreshAccessToken(candidate.refresh)
                 await persistTokens(candidate.id, tokens)
-                return tokens.access
+                return tokens
               })().finally(() => {
                 refreshPromises.delete(candidate.id)
               })
@@ -165,7 +167,36 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
             return inflight
           }
 
-          /** Build the ordered list of candidate accounts to try. */
+          /**
+           * Promote a (non-primary) account into OpenCode's `anthropic` slot so
+           * the next request starts from a healthy account. This self-heals a
+           * dead primary (e.g. `invalid_grant`): after one failover, OpenCode's
+           * own credential points at a working account instead of the dead one.
+           */
+          async function promoteToPrimary(tokens: Tokens) {
+            try {
+              // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
+              await (client as any).auth.set({
+                path: { id: 'anthropic' },
+                body: { type: 'oauth', ...tokens },
+              })
+            } catch {
+              // Promotion is best-effort; never break the response over it.
+            }
+          }
+
+          /**
+           * Build the ordered list of candidate accounts to try:
+           *   1. the primary (OpenCode) account,
+           *   2. store accounts that are available (not cooling down),
+           *   3. store accounts that ARE cooling down, as a LAST RESORT.
+           *
+           * Including cooling accounts (tier 3) is what prevents the session
+           * from stalling: even if every account is on cooldown, we still try
+           * them rather than surfacing an error and waiting for the user. A
+           * cooldown may be stale (e.g. based on an over-long Retry-After), and
+           * trying is strictly better than blocking.
+           */
           function buildCandidates(current: {
             refresh?: string
             access?: string
@@ -176,12 +207,14 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
             access: string
             expires: number
           }> {
-            const candidates: Array<{
+            type Candidate = {
               id: string
               refresh: string
               access: string
               expires: number
-            }> = []
+            }
+            const candidates: Candidate[] = []
+            const seen = new Set<string>()
 
             if (current.refresh) {
               candidates.push({
@@ -190,18 +223,35 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                 access: current.access ?? '',
                 expires: current.expires ?? 0,
               })
+              seen.add(current.refresh)
             }
 
-            // Append available (not cooling-down) store accounts, skipping any
-            // that duplicate the primary refresh token.
-            for (const account of store.available()) {
-              if (account.refresh === current.refresh) continue
+            const now = Date.now()
+            const all = store.list()
+
+            // Tier 2: available store accounts.
+            for (const account of all) {
+              if (seen.has(account.refresh)) continue
+              if (account.cooldownUntil && account.cooldownUntil > now) continue
               candidates.push({
                 id: account.id,
                 refresh: account.refresh,
                 access: account.access,
                 expires: account.expires,
               })
+              seen.add(account.refresh)
+            }
+
+            // Tier 3: cooling store accounts (last resort).
+            for (const account of all) {
+              if (seen.has(account.refresh)) continue
+              candidates.push({
+                id: account.id,
+                refresh: account.refresh,
+                access: account.access,
+                expires: account.expires,
+              })
+              seen.add(account.refresh)
             }
 
             return candidates
@@ -250,63 +300,85 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                 const candidate = candidates[i]
                 if (!candidate) continue
                 const isLast = i === candidates.length - 1
-                const tag =
-                  candidate.id === PRIMARY_ID
-                    ? 'primary'
-                    : candidate.id.slice(0, 8)
+                const isPrimary = candidate.id === PRIMARY_ID
+                const tag = isPrimary ? 'primary' : candidate.id.slice(0, 8)
 
-                let access: string
+                // 1) Ensure a valid token, refreshing if needed. A refresh
+                // failure (e.g. invalid_grant) is NOT surfaced — we cool the
+                // account down and move on to the next candidate.
+                let tokens: Tokens
                 try {
-                  access = await ensureFreshAccess(candidate)
+                  tokens = await ensureFreshTokens(candidate)
                 } catch (error) {
-                  // Refresh failed (e.g. invalidated refresh token). Cool down
-                  // non-primary accounts and try the next candidate.
                   lastError = error
                   const reason =
                     error instanceof Error ? error.message : String(error)
-                  // A dead refresh token won't recover for a long time — cool it
-                  // down for an hour rather than churning every 5 minutes.
+                  // A dead refresh token won't recover soon — cool it down for
+                  // an hour rather than retrying it on every request.
                   markFailover(candidate, Date.now() + 60 * 60_000, reason)
-                  debugLog(`account ${tag}: refresh failed → ${reason}`)
-                  if (isLast) throw error
+                  debugLog(
+                    `account ${tag}: refresh failed → ${reason}`,
+                    isLast ? '(last candidate)' : '→ next account',
+                  )
                   continue
                 }
 
                 const requestHeaders = mergeHeaders(input, init)
-                setOAuthHeaders(requestHeaders, access)
+                setOAuthHeaders(requestHeaders, tokens.access)
 
-                const response = await fetch(rewritten.input, {
-                  ...init,
-                  body,
-                  headers: requestHeaders,
-                  ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
-                })
-
-                // Case 1: a hard failover HTTP status (429/401/403/529).
-                if (isFailoverStatus(response.status)) {
-                  const until = computeCooldownUntil(
-                    response.headers.get('retry-after'),
+                // 2) Issue the request. A network error also fails over.
+                let response: Response
+                try {
+                  response = await fetch(rewritten.input, {
+                    ...init,
+                    body,
+                    headers: requestHeaders,
+                    ...(isInsecure() && { tls: { rejectUnauthorized: false } }),
+                  })
+                } catch (error) {
+                  lastError = error
+                  debugLog(
+                    `account ${tag}: network error → ${
+                      error instanceof Error ? error.message : String(error)
+                    }`,
                   )
-                  markFailover(candidate, until, `HTTP ${response.status}`)
+                  continue
+                }
+
+                // 3a) Hard failover HTTP status (429/401/403/529).
+                if (isFailoverStatus(response.status)) {
+                  markFailover(
+                    candidate,
+                    computeCooldownUntil(response.headers.get('retry-after')),
+                    `HTTP ${response.status}`,
+                  )
                   debugLog(
                     `account ${tag}: HTTP ${response.status} → failover`,
                     isLast ? '(no more accounts)' : '',
                   )
-                  if (isLast) {
-                    lastResponse = response
-                    break
+                  lastResponse = response
+                  if (!isLast) {
+                    await response.body?.cancel().catch(() => {})
+                    continue
                   }
-                  await response.body?.cancel()
-                  continue
+                  break
                 }
 
-                // Case 2: a 2xx response whose stream/body actually carries an
-                // error event (Anthropic often returns 200 + an SSE `error`
-                // event for rate/usage limits). Peek the body to detect this
-                // without discarding the data for the good case.
+                // 3b) A 2xx whose stream carries an error event before any
+                // content (Anthropic returns 200 + an SSE `error` event for
+                // rate/usage limits, sometimes a few events in). Inspect the
+                // start of the stream without discarding the good data.
                 if (response.body) {
-                  const { prefixText, stream } = await peekBody(response.body)
-                  if (textIndicatesFailover(prefixText)) {
+                  const { isError, prefixText, stream } = await inspectStream(
+                    response.body,
+                  )
+                  const rebuilt = new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers,
+                  })
+
+                  if (isError) {
                     markFailover(
                       candidate,
                       computeCooldownUntil(response.headers.get('retry-after')),
@@ -317,37 +389,42 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                       isLast ? '(no more accounts)' : '',
                       prefixText.slice(0, 200),
                     )
-                    if (isLast) {
-                      lastResponse = new Response(stream, {
-                        status: response.status,
-                        statusText: response.statusText,
-                        headers: response.headers,
-                      })
-                      break
+                    lastResponse = rebuilt
+                    if (!isLast) {
+                      await stream.cancel().catch(() => {})
+                      continue
                     }
-                    await stream.cancel().catch(() => {})
-                    continue
+                    break
                   }
 
-                  debugLog(`account ${tag}: OK`)
-                  const rebuilt = new Response(stream, {
-                    status: response.status,
-                    statusText: response.statusText,
-                    headers: response.headers,
-                  })
+                  // Success. Self-heal: if a non-primary account served this,
+                  // promote it into OpenCode's slot for subsequent requests.
+                  if (!isPrimary) {
+                    await promoteToPrimary(tokens)
+                    debugLog(`account ${tag}: OK → promoted to primary`)
+                  } else {
+                    debugLog(`account ${tag}: OK`)
+                  }
                   return createStrippedStream(rebuilt)
                 }
 
+                // Success with no body.
+                if (!isPrimary) await promoteToPrimary(tokens)
                 debugLog(`account ${tag}: OK (no body)`)
                 return createStrippedStream(response)
               }
 
-              // All candidates exhausted — surface the last real response so the
-              // user sees the actual API error, or rethrow the last error.
-              if (lastResponse) return createStrippedStream(lastResponse)
-              if (lastError) throw lastError
-              // No candidates at all (no refresh token) — fall back to a plain
-              // pass-through so behavior matches the single-account baseline.
+              // Every candidate failed. Surface the last real API response (so
+              // the user sees the genuine error) or rethrow the last error.
+              if (lastResponse) {
+                debugLog('all candidates exhausted → surfacing last response')
+                return createStrippedStream(lastResponse)
+              }
+              if (lastError) {
+                debugLog('all candidates exhausted → throwing last error')
+                throw lastError
+              }
+              // No candidates at all (no refresh token) — plain pass-through.
               return fetch(rewritten.input, {
                 ...init,
                 body,

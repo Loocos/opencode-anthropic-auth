@@ -32,7 +32,7 @@ Add the plugin to your OpenCode configuration:
 
 ```json
 {
-  "plugin": ["opencode-anthropic-auth-loocos@1.9.1"]
+  "plugin": ["opencode-anthropic-auth-loocos@1.9.2"]
 }
 ```
 
@@ -64,20 +64,32 @@ tries them in turn:
 
 1. Your primary (OpenCode) account first.
 2. Then each additional account that isn't currently cooling down.
+3. Then, as a **last resort**, accounts that *are* cooling down — so the
+   session never stalls waiting for a human while an account might still work.
 
 Failover triggers when a request fails in any of these ways:
 
 - An HTTP error status: `429` (rate limit), `401`/`403` (auth), or `529`
   (overloaded).
+- A **token refresh failure** such as `invalid_grant` (a logged-out / rotated
+  refresh token). This is treated as that account being unavailable — the
+  plugin moves on to the next account instead of surfacing the error.
 - **An error *inside* a `200 OK` streaming response.** Claude Pro/Max usage
   limits frequently come back as HTTP 200 with an `error` event in the SSE
-  stream (e.g. `rate_limit_error`), not as a `429`. The plugin peeks at the
-  start of the stream and fails over in this case too — this is the common
-  "my account got restricted" scenario.
+  stream (e.g. `rate_limit_error`), not as a `429`. The plugin inspects the
+  stream up to the point real content begins — so even an error that arrives a
+  few events in (after `message_start`) triggers failover. This is the common
+  "my account got restricted mid-session" scenario.
 
 The exhausted account is put on a cooldown (respecting any `Retry-After`
-header) and the same request is transparently retried on the next available
-account. An error is only surfaced to you once **every** account is exhausted.
+header) and the same request is transparently retried on the next account. An
+error is only surfaced to you once **every** account has failed.
+
+**Self-healing primary:** when a non-primary account serves a request because
+the primary failed (e.g. the primary's refresh token died), that working
+account is promoted into OpenCode's own credential slot. Subsequent requests
+then start from a healthy account instead of retrying the dead primary every
+time.
 
 Access tokens are refreshed per account, and rotated refresh tokens are
 persisted automatically. Cooldowns expire on their own, so an account becomes

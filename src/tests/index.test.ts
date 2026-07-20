@@ -934,4 +934,99 @@ describe('multi-account failover', () => {
     expect(text).toContain('content_block_delta')
     expect(text).toContain('hello')
   })
+
+  /** A primary OAuth credential whose access token is already expired. */
+  function expiredPrimaryAuth() {
+    return {
+      type: 'oauth' as const,
+      access: 'expired-primary-access',
+      refresh: 'dead-primary-refresh',
+      expires: Date.now() - 1000,
+    }
+  }
+
+  test('invalid_grant on primary fails over to a store account and promotes it', async () => {
+    const store = new AccountStore(storePath)
+    store.add({
+      refresh: 'second-refresh',
+      access: 'second-access',
+      expires: Date.now() + 100_000,
+    })
+
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      // Primary's refresh token is dead.
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ error: 'invalid_grant' }), {
+            status: 400,
+          }),
+        )
+      }
+      if (url.includes('/v1/messages')) {
+        const auth = (init?.headers as Headers).get('authorization') ?? ''
+        // Only the second account should ever reach the messages endpoint.
+        expect(auth).toContain('second-access')
+        return Promise.resolve(new Response(null, { status: 200 }))
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const mockClient = createMockClient()
+    const plugin = await getPlugin(mockClient)
+    const result = await plugin.auth.loader(
+      () => Promise.resolve(expiredPrimaryAuth()),
+      { models: {} },
+    )
+
+    // Must NOT throw invalid_grant — it should transparently fail over.
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(response.status).toBe(200)
+
+    // The working second account should be promoted into OpenCode's slot.
+    expect(mockClient.auth.set).toHaveBeenCalled()
+    const call = (mockClient.auth.set as any).mock.calls[0][0]
+    expect(call.path.id).toBe('anthropic')
+    expect(call.body.access).toBe('second-access')
+  })
+
+  test('tries a cooling account as a last resort instead of surfacing an error', async () => {
+    // Primary is dead AND the only other account is cooling down. The plugin
+    // should still try the cooling account rather than throw.
+    const store = new AccountStore(storePath)
+    const cooling = store.add({
+      refresh: 'cooling-refresh',
+      access: 'cooling-access',
+      expires: Date.now() + 100_000,
+    })
+    store.markCooldown(cooling.id, Date.now() + 10 * 60_000, 'HTTP 429')
+
+    let servedByCooling = false
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ error: 'invalid_grant' }), {
+            status: 400,
+          }),
+        )
+      }
+      if (url.includes('/v1/messages')) {
+        const auth = (init?.headers as Headers).get('authorization') ?? ''
+        if (auth.includes('cooling-access')) servedByCooling = true
+        return Promise.resolve(new Response(null, { status: 200 }))
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () => Promise.resolve(expiredPrimaryAuth()),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(response.status).toBe(200)
+    expect(servedByCooling).toBe(true)
+  })
 })

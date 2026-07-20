@@ -3,6 +3,12 @@
 > Forked from [`@ex-machina/opencode-anthropic-auth`](https://github.com/ex-machina-co/opencode-anthropic-auth).
 > Entries below version 1.9.0 are from the upstream project.
 
+## 1.9.2
+
+### Patch Changes
+
+- Make failover actually switch accounts for `invalid_grant` and usage limits instead of stopping the session. Three fixes: (1) **A dead/rate-limited primary no longer surfaces `invalid_grant` to you** — the plugin now tries every other account (including ones currently cooling down, as a last resort) before ever showing an error, and only throws when literally every account has failed. (2) **Self-healing primary** — when another account serves a request because the primary failed, that account is promoted into OpenCode's credential slot, so subsequent requests start from a healthy account instead of retrying the dead one. (3) **Mid-stream error detection** — the plugin now inspects the response until real content begins, so a `rate_limit_error` that arrives a few SSE events in (after `message_start`) still triggers failover instead of being streamed to you as a broken response.
+
 ## 1.9.1
 
 ### Patch Changes

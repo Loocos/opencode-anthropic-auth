@@ -141,6 +141,22 @@ function messageHintsFailover(message: unknown): boolean {
 }
 
 /**
+ * Does the buffered text contain a real content event? Once actual assistant
+ * content has started streaming, we've "committed" to this account and can no
+ * longer fail over (retrying would duplicate content). `message_start` alone
+ * does NOT count — a rate-limit `error` event can still follow it.
+ */
+export function textIndicatesContent(text: string): boolean {
+  if (!text) return false
+  return (
+    text.includes('content_block_start') ||
+    text.includes('content_block_delta') ||
+    text.includes('"type":"content_block') ||
+    text.includes('"type": "content_block')
+  )
+}
+
+/**
  * Peek at the beginning of a streaming response body to detect an early
  * SSE/JSON error, WITHOUT discarding the data. Reads until the first SSE event
  * boundary (a blank line) or `maxBytes`, whichever comes first.
@@ -202,6 +218,82 @@ export async function peekBody(
   })
 
   return { prefixText: text, stream }
+}
+
+/**
+ * Inspect the start of a streaming response to classify it as an error or a
+ * genuine (content-bearing) response WITHOUT discarding data.
+ *
+ * Unlike {@link peekBody}, this keeps reading past the first SSE event until it
+ * sees EITHER a failover error OR the first real content event (or hits
+ * `maxBytes`). This catches rate-limit / usage-limit `error` events that arrive
+ * a few events into the stream (e.g. after `message_start` and `ping`), which
+ * is the common "restricted mid-response" case.
+ *
+ * Returns:
+ *  - `isError`: true if a rate-limit / usage-limit / auth error was detected
+ *  - `prefixText`: the decoded text inspected (for logging)
+ *  - `stream`: a fresh stream replaying everything read plus the remainder, so a
+ *    good response is delivered to the caller unchanged.
+ */
+export async function inspectStream(
+  // biome-ignore lint/suspicious/noExplicitAny: bridge DOM vs node:stream/web reader types
+  body: any,
+  maxBytes = 65536,
+): Promise<{
+  isError: boolean
+  prefixText: string
+  stream: ReadableStream<Uint8Array>
+}> {
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  let text = ''
+  let isError = false
+
+  while (total < maxBytes) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (value) {
+      chunks.push(value)
+      total += value.byteLength
+      text += decoder.decode(value, { stream: true })
+      if (textIndicatesFailover(text)) {
+        isError = true
+        break
+      }
+      // Once real content has begun, stop inspecting and commit to this stream.
+      if (textIndicatesContent(text)) break
+    }
+  }
+  text += decoder.decode()
+
+  const prefixBytes = concatChunks(chunks, total)
+
+  let prefixSent = false
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (!prefixSent) {
+        prefixSent = true
+        if (prefixBytes.byteLength > 0) {
+          controller.enqueue(prefixBytes)
+          return
+        }
+      }
+      const { done, value } = await reader.read()
+      if (done) {
+        controller.close()
+        return
+      }
+      controller.enqueue(value)
+    },
+    cancel(reason) {
+      return reader.cancel(reason)
+    },
+  })
+
+  return { isError, prefixText: text, stream }
 }
 
 function concatChunks(chunks: Uint8Array[], total: number): Uint8Array {

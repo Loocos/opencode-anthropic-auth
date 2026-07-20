@@ -1,5 +1,11 @@
 import { describe, expect, test } from 'bun:test'
-import { isFailoverStatus, peekBody, textIndicatesFailover } from '../failover'
+import {
+  inspectStream,
+  isFailoverStatus,
+  peekBody,
+  textIndicatesContent,
+  textIndicatesFailover,
+} from '../failover'
 
 describe('isFailoverStatus', () => {
   test('429/401/403/529 trigger failover', () => {
@@ -97,5 +103,79 @@ describe('peekBody', () => {
     ])
     const { prefixText } = await peekBody(body)
     expect(textIndicatesFailover(prefixText)).toBe(true)
+  })
+})
+
+describe('textIndicatesContent', () => {
+  test('true for content_block events', () => {
+    expect(
+      textIndicatesContent('event: content_block_start\ndata: {}\n\n'),
+    ).toBe(true)
+    expect(
+      textIndicatesContent(
+        'event: content_block_delta\ndata: {"delta":{"text":"hi"}}\n\n',
+      ),
+    ).toBe(true)
+  })
+  test('false for message_start alone (an error may still follow)', () => {
+    expect(
+      textIndicatesContent(
+        'event: message_start\ndata: {"type":"message_start"}\n\n',
+      ),
+    ).toBe(false)
+  })
+})
+
+describe('inspectStream', () => {
+  function streamFrom(parts: string[]): ReadableStream<Uint8Array> {
+    const encoder = new TextEncoder()
+    let i = 0
+    return new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (i < parts.length) {
+          controller.enqueue(encoder.encode(parts[i]!))
+          i += 1
+        } else {
+          controller.close()
+        }
+      },
+    })
+  }
+
+  test('flags an error that appears AFTER message_start (mid-stream)', async () => {
+    // The critical case: a good-looking start, then a rate-limit error before
+    // any content is produced.
+    const body = streamFrom([
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"m1"}}\n\n',
+      'event: ping\ndata: {"type":"ping"}\n\n',
+      'event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"usage limit reached"}}\n\n',
+    ])
+    const { isError, stream } = await inspectStream(body)
+    expect(isError).toBe(true)
+    // Stream is still fully replayable (we didn't lose bytes).
+    const full = await new Response(stream).text()
+    expect(full).toContain('message_start')
+    expect(full).toContain('rate_limit_error')
+  })
+
+  test('commits (no error) once content starts and replays everything', async () => {
+    const body = streamFrom([
+      'event: message_start\ndata: {"type":"message_start"}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start"}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"hello"}}\n\n',
+    ])
+    const { isError, stream } = await inspectStream(body)
+    expect(isError).toBe(false)
+    const full = await new Response(stream).text()
+    expect(full).toContain('content_block_delta')
+    expect(full).toContain('hello')
+  })
+
+  test('flags an immediate error event', async () => {
+    const body = streamFrom([
+      'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}\n\n',
+    ])
+    const { isError } = await inspectStream(body)
+    expect(isError).toBe(true)
   })
 })
