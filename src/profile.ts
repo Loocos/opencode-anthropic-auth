@@ -1,4 +1,10 @@
-import { PROFILE_URL, REQUIRED_BETAS, USER_AGENT } from './constants.ts'
+import { PROFILE_URL, USER_AGENT } from './constants.ts'
+
+/**
+ * The OAuth-specific beta flag. The profile endpoint is an OAuth metadata
+ * endpoint, so we send only this — not the `/v1/messages` inference betas.
+ */
+const OAUTH_BETA = 'oauth-2025-04-20'
 
 export type AccountProfile = {
   email?: string
@@ -24,7 +30,7 @@ export async function fetchAccountProfile(
       method: 'GET',
       headers: {
         Authorization: `Bearer ${accessToken}`,
-        'anthropic-beta': REQUIRED_BETAS.join(','),
+        'anthropic-beta': OAUTH_BETA,
         Accept: 'application/json',
         'User-Agent': USER_AGENT,
       },

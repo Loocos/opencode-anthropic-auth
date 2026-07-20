@@ -74,15 +74,22 @@ function readStore(path: string): AccountStoreFile {
   try {
     const parsed = JSON.parse(raw) as Partial<AccountStoreFile>
     if (!parsed || !Array.isArray(parsed.accounts)) return emptyStore()
-    // Filter to well-formed account entries defensively.
-    const accounts = parsed.accounts.filter(
-      (a): a is Account =>
-        !!a &&
-        typeof a.id === 'string' &&
-        typeof a.refresh === 'string' &&
-        typeof a.access === 'string' &&
-        typeof a.expires === 'number',
-    )
+    // Keep well-formed entries and normalize the (required) label so it's
+    // always a string, even for entries written by older/hand-edited stores.
+    const accounts = parsed.accounts
+      .filter(
+        (a): a is Account =>
+          !!a &&
+          typeof a.id === 'string' &&
+          typeof a.refresh === 'string' &&
+          typeof a.access === 'string' &&
+          typeof a.expires === 'number',
+      )
+      .map((a) => ({
+        ...a,
+        label:
+          typeof a.label === 'string' && a.label ? a.label : (a.email ?? a.id),
+      }))
     return { version: 1, accounts }
   } catch {
     // Corrupt JSON → don't crash the plugin; start fresh.

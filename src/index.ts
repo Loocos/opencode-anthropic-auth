@@ -311,6 +311,15 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
               let body = init?.body
               if (body && typeof body === 'string') {
                 body = rewriteRequestBody(body)
+              } else if (body != null && candidates.length > 1) {
+                // A non-string body (ReadableStream/Blob/BufferSource) can only
+                // be consumed once. When failover is possible we buffer it up
+                // front so each candidate can re-send the same bytes instead of
+                // the first fetch draining it and the retries sending nothing.
+                body = new Uint8Array(
+                  // biome-ignore lint/suspicious/noExplicitAny: BodyInit is broad
+                  await new Response(body as any).arrayBuffer(),
+                )
               }
               const rewritten = rewriteUrl(input)
 
@@ -389,9 +398,13 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
 
                 // 3b) A 2xx whose stream carries an error event before any
                 // content (Anthropic returns 200 + an SSE `error` event for
-                // rate/usage limits, sometimes a few events in). Inspect the
-                // start of the stream without discarding the good data.
-                if (response.body) {
+                // rate/usage limits, sometimes a few events in). We only inspect
+                // the stream when failover is actually possible — i.e. this is a
+                // streaming 2xx response AND another candidate remains to try.
+                // This avoids adding first-token latency on the common
+                // single-account path and never buffers the last candidate's (or
+                // a non-streaming) response.
+                if (response.ok && response.body && !isLast) {
                   const { isError, prefixText, stream } = await inspectStream(
                     response.body,
                   )
@@ -408,16 +421,12 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                       'stream error (rate/usage limit)',
                     )
                     debugLog(
-                      `account ${tag}: stream error → failover`,
-                      isLast ? '(no more accounts)' : '',
+                      `account ${tag}: stream error → failover → next account`,
                       prefixText.slice(0, 200),
                     )
                     lastResponse = rebuilt
-                    if (!isLast) {
-                      await stream.cancel().catch(() => {})
-                      continue
-                    }
-                    break
+                    await stream.cancel().catch(() => {})
+                    continue
                   }
 
                   // Success. Self-heal: if a non-primary account served this,
@@ -435,12 +444,24 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                   return createStrippedStream(rebuilt)
                 }
 
-                // Success with no body.
-                if (!isPrimary) await promoteToPrimary(tokens)
-                if (!candidate.email) {
-                  void enrichEmail(candidate.refresh, tokens.access)
+                // Otherwise stream/return as-is (last candidate, non-streaming,
+                // or a non-failover non-2xx error). Promote + label only on an
+                // actual success so a passthrough error isn't treated as OK.
+                if (response.ok) {
+                  if (!isPrimary) {
+                    await promoteToPrimary(tokens)
+                    debugLog(`account ${tag}: OK → promoted to primary`)
+                  } else {
+                    debugLog(`account ${tag}: OK`)
+                  }
+                  if (!candidate.email) {
+                    void enrichEmail(candidate.refresh, tokens.access)
+                  }
+                } else {
+                  debugLog(
+                    `account ${tag}: HTTP ${response.status} (passthrough)`,
+                  )
                 }
-                debugLog(`account ${tag}: OK (no body)`)
                 return createStrippedStream(response)
               }
 
