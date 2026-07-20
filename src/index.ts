@@ -294,14 +294,23 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
            * primary we cool its matching store entry (by refresh token) so that
            * once another account is promoted, the demoted-but-exhausted account
            * isn't immediately treated as available and retried.
+           *
+           * `refresh` MUST be the account's CURRENT refresh token. When the
+           * primary was refreshed earlier this request, `ensureFreshTokens`
+           * rotated its token and `updateTokensByRefresh` already moved the store
+           * twin onto the new token — so the caller must pass `tokens.refresh`
+           * (the post-rotation value), not the stale pre-rotation
+           * `candidate.refresh`, or the lookup would miss and the cooldown would
+           * be silently dropped.
            */
           function markFailover(
             candidate: { id: string; refresh: string },
+            refresh: string,
             until: number,
             reason: string,
           ) {
             if (candidate.id === PRIMARY_ID) {
-              store.markCooldownByRefresh(candidate.refresh, until, reason)
+              store.markCooldownByRefresh(refresh, until, reason)
             } else {
               store.markCooldown(candidate.id, until, reason)
             }
@@ -376,8 +385,15 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                   const reason =
                     error instanceof Error ? error.message : String(error)
                   // A dead refresh token won't recover soon — cool it down for
-                  // an hour rather than retrying it on every request.
-                  markFailover(candidate, Date.now() + 60 * 60_000, reason)
+                  // an hour rather than retrying it on every request. The refresh
+                  // FAILED, so no rotation happened and `candidate.refresh` is
+                  // still the token the store twin holds.
+                  markFailover(
+                    candidate,
+                    candidate.refresh,
+                    Date.now() + 60 * 60_000,
+                    reason,
+                  )
                   debugLog(
                     `account ${tag}: refresh failed → ${reason}`,
                     isLast ? '(last candidate)' : '→ next account',
@@ -427,6 +443,9 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                 if (isFailoverStatus(response.status)) {
                   markFailover(
                     candidate,
+                    // Post-rotation token: the store twin was moved onto it if
+                    // ensureFreshTokens refreshed the primary above.
+                    tokens.refresh,
                     computeCooldownUntil(response.headers.get('retry-after')),
                     `HTTP ${response.status}`,
                   )
@@ -473,6 +492,8 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                   if (isError) {
                     markFailover(
                       candidate,
+                      // Post-rotation token (see the HTTP-error path above).
+                      tokens.refresh,
                       computeCooldownUntil(response.headers.get('retry-after')),
                       'stream error (rate/usage limit)',
                     )

@@ -684,6 +684,69 @@ describe('multi-account failover', () => {
     expect(available).toHaveLength(1)
   })
 
+  test('cools the primary by its POST-rotation token after a refresh then 429', async () => {
+    // Regression: when the primary's token is rotated by ensureFreshTokens and
+    // it THEN hits a 429, the cooldown must be recorded against the NEW refresh
+    // token (which the store twin now holds), not the stale pre-rotation one.
+    // Otherwise the lookup misses, no cooldown is written, and the exhausted
+    // primary is rebuilt as a candidate and retried on every later request.
+    const store = new AccountStore(storePath)
+    store.add({
+      refresh: 'second-refresh',
+      access: 'second-access',
+      expires: Date.now() + 100_000,
+    })
+
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        // The primary's expired token rotates to a brand-new refresh token.
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              refresh_token: 'primary-rotated',
+              access_token: 'primary-new-access',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      if (url.includes('/v1/messages')) {
+        const auth = (init?.headers as Headers).get('authorization') ?? ''
+        // The freshly-rotated primary is rate-limited; the second succeeds.
+        if (auth.includes('primary-new-access')) {
+          return Promise.resolve(new Response('rate limited', { status: 429 }))
+        }
+        return Promise.resolve(new Response(null, { status: 200 }))
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'stale-primary-access',
+          refresh: 'primary-refresh',
+          expires: Date.now() - 1000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(response.status).toBe(200)
+
+    // The primary's store twin (now keyed by its rotated refresh) must be
+    // cooling down. With the bug the lookup missed and it stayed available.
+    const twin = new AccountStore(storePath)
+      .list()
+      .find((a) => a.refresh === 'primary-rotated')
+    expect(twin).toBeDefined()
+    expect(twin!.cooldownUntil ?? 0).toBeGreaterThan(Date.now())
+  })
+
   test('returns the last error response when all accounts are exhausted', async () => {
     // Primary + one store account, both rate-limited.
     const store = new AccountStore(storePath)
