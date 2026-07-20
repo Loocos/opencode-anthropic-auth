@@ -144,8 +144,19 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
             let inflight = refreshPromises.get(candidate.id)
             if (!inflight) {
               inflight = (async () => {
-                const tokens = await refreshAccessToken(candidate.refresh)
-                await persistTokens(candidate.id, tokens, candidate.refresh)
+                // For the primary, re-read OpenCode's credential just before
+                // refreshing: another in-flight request may have rotated the
+                // refresh token since this request captured its snapshot, and
+                // reusing the stale token would fail with `invalid_grant`.
+                let refresh = candidate.refresh
+                if (candidate.id === PRIMARY_ID) {
+                  const fresh = await getAuth()
+                  if (fresh.type === 'oauth' && fresh.refresh) {
+                    refresh = fresh.refresh
+                  }
+                }
+                const tokens = await refreshAccessToken(refresh)
+                await persistTokens(candidate.id, tokens, refresh)
                 return tokens
               })().finally(() => {
                 refreshPromises.delete(candidate.id)
@@ -273,19 +284,38 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
           }
 
           /**
-           * Put a candidate on cooldown so it's skipped next time. The primary
-           * (OpenCode) account isn't in the store, so we can't persist a
-           * cooldown for it — but it's always tried first anyway, so failover to
-           * the store accounts still happens within a single request.
+           * Put a candidate on cooldown so it's skipped next time. For the
+           * primary we cool its matching store entry (by refresh token) so that
+           * once another account is promoted, the demoted-but-exhausted account
+           * isn't immediately treated as available and retried.
            */
           function markFailover(
-            candidate: { id: string },
+            candidate: { id: string; refresh: string },
             until: number,
             reason: string,
           ) {
-            if (candidate.id !== PRIMARY_ID) {
+            if (candidate.id === PRIMARY_ID) {
+              store.markCooldownByRefresh(candidate.refresh, until, reason)
+            } else {
               store.markCooldown(candidate.id, until, reason)
             }
+          }
+
+          /**
+           * Read a (usually small error) response body into memory and return a
+           * fresh, still-readable Response. Used when we want to keep a failed
+           * response around to surface later without holding an open/cancelled
+           * stream.
+           */
+          async function bufferResponse(response: Response): Promise<Response> {
+            const buf = await response
+              .arrayBuffer()
+              .catch(() => new ArrayBuffer(0))
+            return new Response(buf, {
+              status: response.status,
+              statusText: response.statusText,
+              headers: response.headers,
+            })
           }
 
           return {
@@ -377,6 +407,20 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                   continue
                 }
 
+                // Mark this candidate successful: promote (self-heal) + label.
+                const onSuccess = async () => {
+                  if (!isPrimary) {
+                    await promoteToPrimary(tokens)
+                    debugLog(`account ${tag}: OK → promoted to primary`)
+                  } else {
+                    debugLog(`account ${tag}: OK`)
+                  }
+                  if (!candidate.email) {
+                    // Match by the (possibly rotated) current refresh token.
+                    void enrichEmail(tokens.refresh, tokens.access)
+                  }
+                }
+
                 // 3a) Hard failover HTTP status (429/401/403/529).
                 if (isFailoverStatus(response.status)) {
                   markFailover(
@@ -384,27 +428,27 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                     computeCooldownUntil(response.headers.get('retry-after')),
                     `HTTP ${response.status}`,
                   )
-                  debugLog(
-                    `account ${tag}: HTTP ${response.status} → failover`,
-                    isLast ? '(no more accounts)' : '',
-                  )
-                  lastResponse = response
-                  if (!isLast) {
-                    await response.body?.cancel().catch(() => {})
-                    continue
+                  if (isLast) {
+                    // Nothing left to try — surface the real error (body intact).
+                    debugLog(
+                      `account ${tag}: HTTP ${response.status} (no more accounts)`,
+                    )
+                    return createStrippedStream(response)
                   }
-                  break
+                  debugLog(
+                    `account ${tag}: HTTP ${response.status} → next account`,
+                  )
+                  lastResponse = await bufferResponse(response)
+                  continue
                 }
 
                 // 3b) A 2xx whose stream carries an error event before any
                 // content (Anthropic returns 200 + an SSE `error` event for
-                // rate/usage limits, sometimes a few events in). We only inspect
-                // the stream when failover is actually possible — i.e. this is a
-                // streaming 2xx response AND another candidate remains to try.
-                // This avoids adding first-token latency on the common
-                // single-account path and never buffers the last candidate's (or
-                // a non-streaming) response.
-                if (response.ok && response.body && !isLast) {
+                // rate/usage limits, sometimes a few events in). Inspect only
+                // when failover is possible at all (more than one candidate) so
+                // the common single-account path streams directly with no added
+                // first-token latency.
+                if (response.ok && response.body && candidates.length > 1) {
                   const { isError, prefixText, stream } = await inspectStream(
                     response.body,
                   )
@@ -420,43 +464,31 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                       computeCooldownUntil(response.headers.get('retry-after')),
                       'stream error (rate/usage limit)',
                     )
+                    if (isLast) {
+                      // No more accounts — surface the error stream as-is.
+                      debugLog(
+                        `account ${tag}: stream error (no more accounts)`,
+                        prefixText.slice(0, 200),
+                      )
+                      return createStrippedStream(rebuilt)
+                    }
                     debugLog(
-                      `account ${tag}: stream error → failover → next account`,
+                      `account ${tag}: stream error → next account`,
                       prefixText.slice(0, 200),
                     )
-                    lastResponse = rebuilt
-                    await stream.cancel().catch(() => {})
+                    lastResponse = await bufferResponse(rebuilt)
                     continue
                   }
 
-                  // Success. Self-heal: if a non-primary account served this,
-                  // promote it into OpenCode's slot for subsequent requests.
-                  if (!isPrimary) {
-                    await promoteToPrimary(tokens)
-                    debugLog(`account ${tag}: OK → promoted to primary`)
-                  } else {
-                    debugLog(`account ${tag}: OK`)
-                  }
-                  // Backfill an email label for accounts that lack one.
-                  if (!candidate.email) {
-                    void enrichEmail(candidate.refresh, tokens.access)
-                  }
+                  await onSuccess()
                   return createStrippedStream(rebuilt)
                 }
 
-                // Otherwise stream/return as-is (last candidate, non-streaming,
-                // or a non-failover non-2xx error). Promote + label only on an
-                // actual success so a passthrough error isn't treated as OK.
+                // Otherwise stream/return as-is: the single-account path, or a
+                // non-failover non-2xx error. Promote + label only on an actual
+                // success so a passthrough error isn't treated as healthy.
                 if (response.ok) {
-                  if (!isPrimary) {
-                    await promoteToPrimary(tokens)
-                    debugLog(`account ${tag}: OK → promoted to primary`)
-                  } else {
-                    debugLog(`account ${tag}: OK`)
-                  }
-                  if (!candidate.email) {
-                    void enrichEmail(candidate.refresh, tokens.access)
-                  }
+                  await onSuccess()
                 } else {
                   debugLog(
                     `account ${tag}: HTTP ${response.status} (passthrough)`,

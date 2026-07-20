@@ -157,78 +157,14 @@ export function textIndicatesContent(text: string): boolean {
 }
 
 /**
- * Peek at the beginning of a streaming response body to detect an early
- * SSE/JSON error, WITHOUT discarding the data. Reads until the first SSE event
- * boundary (a blank line) or `maxBytes`, whichever comes first.
- *
- * Returns:
- *  - `prefixText`: the decoded text we peeked at (for error detection)
- *  - `stream`: a fresh `ReadableStream` that replays the peeked bytes followed
- *    by the remainder of the original body, so a non-error response streams to
- *    the caller unchanged.
- *
- * `body` is typed loosely (`any`) to avoid friction between the DOM and
- * `node:stream/web` ReadableStream type definitions under Bun.
- */
-export async function peekBody(
-  // biome-ignore lint/suspicious/noExplicitAny: bridge DOM vs node:stream/web reader types
-  body: any,
-  maxBytes = 8192,
-): Promise<{ prefixText: string; stream: ReadableStream<Uint8Array> }> {
-  const reader = body.getReader()
-  const decoder = new TextDecoder()
-  const chunks: Uint8Array[] = []
-  let total = 0
-  let text = ''
-
-  while (total < maxBytes) {
-    const { done, value } = await reader.read()
-    if (done) break
-    if (value) {
-      chunks.push(value)
-      total += value.byteLength
-      text += decoder.decode(value, { stream: true })
-      if (text.includes('\n\n') || text.includes('\r\n\r\n')) break
-    }
-  }
-  text += decoder.decode()
-
-  const prefixBytes = concatChunks(chunks, total)
-
-  let prefixSent = false
-  const stream = new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      if (!prefixSent) {
-        prefixSent = true
-        if (prefixBytes.byteLength > 0) {
-          controller.enqueue(prefixBytes)
-          return
-        }
-      }
-      const { done, value } = await reader.read()
-      if (done) {
-        controller.close()
-        return
-      }
-      controller.enqueue(value)
-    },
-    cancel(reason) {
-      return reader.cancel(reason)
-    },
-  })
-
-  return { prefixText: text, stream }
-}
-
-/**
  * Inspect the start of a streaming response to classify it as an error or a
  * genuine (content-bearing) response WITHOUT discarding data.
  *
- * Unlike {@link peekBody}, this keeps reading past the first SSE event until it
- * sees EITHER a failover error OR the first real content event (or hits
- * `maxBytes`). This catches rate-limit / usage-limit `error` events that arrive
- * a few events into the stream (e.g. after `message_start` and `ping`), which
- * is the common "restricted mid-response" case.
+ * It keeps reading past the first SSE event until it sees EITHER a failover
+ * error OR the first real content event (or hits `maxBytes`). This catches
+ * rate-limit / usage-limit `error` events that arrive a few events into the
+ * stream (e.g. after `message_start` and `ping`), which is the common
+ * "restricted mid-response" case.
  *
  * Returns:
  *  - `isError`: true if a rate-limit / usage-limit / auth error was detected

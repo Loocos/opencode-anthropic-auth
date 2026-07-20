@@ -2,7 +2,6 @@ import { describe, expect, test } from 'bun:test'
 import {
   inspectStream,
   isFailoverStatus,
-  peekBody,
   textIndicatesContent,
   textIndicatesFailover,
 } from '../failover'
@@ -62,47 +61,6 @@ describe('textIndicatesFailover', () => {
     const partial =
       'event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","mess'
     expect(textIndicatesFailover(partial)).toBe(true)
-  })
-})
-
-describe('peekBody', () => {
-  function streamFrom(parts: string[]): ReadableStream<Uint8Array> {
-    const encoder = new TextEncoder()
-    let i = 0
-    return new ReadableStream<Uint8Array>({
-      pull(controller) {
-        if (i < parts.length) {
-          controller.enqueue(encoder.encode(parts[i]!))
-          i += 1
-        } else {
-          controller.close()
-        }
-      },
-    })
-  }
-
-  test('peeks the first event and replays the full stream', async () => {
-    const body = streamFrom([
-      'event: message_start\ndata: {"type":"message_start"}\n\n',
-      'event: content_block_delta\ndata: {"type":"content_block_delta"}\n\n',
-    ])
-
-    const { prefixText, stream } = await peekBody(body)
-    // Prefix should contain the first event.
-    expect(prefixText).toContain('message_start')
-
-    // The rebuilt stream should replay EVERYTHING (prefix + remainder).
-    const full = await new Response(stream).text()
-    expect(full).toContain('message_start')
-    expect(full).toContain('content_block_delta')
-  })
-
-  test('detects an error in the peeked prefix', async () => {
-    const body = streamFrom([
-      'event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"exceeded"}}\n\n',
-    ])
-    const { prefixText } = await peekBody(body)
-    expect(textIndicatesFailover(prefixText)).toBe(true)
   })
 })
 

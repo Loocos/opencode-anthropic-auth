@@ -99,10 +99,10 @@ function readStore(path: string): AccountStoreFile {
 
 function writeStore(path: string, store: AccountStoreFile): void {
   mkdirSync(dirname(path), { recursive: true })
-  const tmp = `${path}.tmp`
+  // Use a per-writer unique temp name so two concurrent writers can't clobber
+  // the same temp file between write and rename.
+  const tmp = `${path}.${process.pid}.${crypto.randomUUID()}.tmp`
   const data = JSON.stringify(store, null, 2)
-  // Write to a temp file then rename for atomicity (avoids torn writes when
-  // multiple OpenCode sessions persist tokens concurrently).
   writeFileSync(tmp, data, { mode: 0o600 })
   // node:fs renameSync is atomic on the same filesystem.
   renameSync(tmp, path)
@@ -146,8 +146,13 @@ function collapseDuplicates(store: AccountStoreFile): boolean {
 /**
  * File-backed store for multiple Claude OAuth accounts.
  *
- * All mutations re-read the file first (merge semantics) so concurrent
- * OpenCode sessions don't clobber each other's account list.
+ * Every mutation re-reads the file immediately before writing (so it operates
+ * on the latest on-disk snapshot) and writes atomically via a unique temp file
+ * + rename. This narrows — but does not fully eliminate — the read-modify-write
+ * window between concurrent OpenCode sessions; there is no cross-process lock,
+ * so a last-writer-wins update is still theoretically possible. In practice
+ * mutations are small and infrequent, and the atomic rename guarantees readers
+ * never observe a partially written file.
  */
 export class AccountStore {
   private readonly path: string
@@ -344,6 +349,21 @@ export class AccountStore {
   markCooldown(id: string, until: number, reason?: string): void {
     const store = readStore(this.path)
     const account = store.accounts.find((a) => a.id === id)
+    if (!account) return
+    account.cooldownUntil = until
+    if (reason) account.lastError = reason
+    writeStore(this.path, store)
+  }
+
+  /**
+   * Cool down the account matching `refresh`. Used to cool the store entry that
+   * mirrors OpenCode's primary slot (addressed by token, not store id) so a
+   * rate-limited primary is skipped after it's demoted. No-op if none matches.
+   */
+  markCooldownByRefresh(refresh: string, until: number, reason?: string): void {
+    if (!refresh) return
+    const store = readStore(this.path)
+    const account = store.accounts.find((a) => a.refresh === refresh)
     if (!account) return
     account.cooldownUntil = until
     if (reason) account.lastError = reason
