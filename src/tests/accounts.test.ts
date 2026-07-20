@@ -54,6 +54,57 @@ describe('AccountStore', () => {
     expect(second.label).toBe('Account 2')
   })
 
+  test('add uses email as the label when provided', () => {
+    const store = new AccountStore(storePath)
+    const account = store.add({
+      refresh: 'r1',
+      access: 'a1',
+      expires: 1,
+      email: 'me@example.com',
+    })
+    expect(account.email).toBe('me@example.com')
+    expect(account.label).toBe('me@example.com')
+  })
+
+  test('add backfills email + label on an existing account', () => {
+    const store = new AccountStore(storePath)
+    store.add({ refresh: 'r1', access: 'a1', expires: 1 })
+    const updated = store.add({
+      refresh: 'r1',
+      access: 'a2',
+      expires: 2,
+      email: 'me@example.com',
+    })
+    expect(store.list()).toHaveLength(1)
+    expect(updated.email).toBe('me@example.com')
+    expect(updated.label).toBe('me@example.com')
+  })
+
+  test('setEmail updates email + label by id', () => {
+    const store = new AccountStore(storePath)
+    const account = store.add({ refresh: 'r1', access: 'a1', expires: 1 })
+    store.setEmail(account.id, 'x@example.com')
+    const updated = store.list()[0]!
+    expect(updated.email).toBe('x@example.com')
+    expect(updated.label).toBe('x@example.com')
+    // Empty email is ignored.
+    store.setEmail(account.id, '')
+    expect(store.list()[0]!.email).toBe('x@example.com')
+  })
+
+  test('setEmailByRefresh updates the matching account', () => {
+    const store = new AccountStore(storePath)
+    store.add({ refresh: 'r1', access: 'a1', expires: 1 })
+    store.add({ refresh: 'r2', access: 'a2', expires: 2 })
+    store.setEmailByRefresh('r2', 'second@example.com')
+    expect(store.list().find((a) => a.refresh === 'r2')!.label).toBe(
+      'second@example.com',
+    )
+    expect(store.list().find((a) => a.refresh === 'r1')!.email).toBeUndefined()
+    // Unknown refresh is a no-op (no throw).
+    store.setEmailByRefresh('missing', 'x@example.com')
+  })
+
   test('remove deletes an account by id', () => {
     const store = new AccountStore(storePath)
     const account = store.add({ refresh: 'r1', access: 'a1', expires: 1 })

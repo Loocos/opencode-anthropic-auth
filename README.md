@@ -32,7 +32,7 @@ Add the plugin to your OpenCode configuration:
 
 ```json
 {
-  "plugin": ["opencode-anthropic-auth-loocos@1.9.2"]
+  "plugin": ["opencode-anthropic-auth-loocos@1.10.0"]
 }
 ```
 
@@ -97,15 +97,25 @@ available again after its rate-limit window passes. An account whose refresh
 token is permanently invalid (e.g. logged out elsewhere) is cooled down for an
 hour so it stops being retried on every request.
 
+### Account labels (email)
+
+Each account is labeled with its Claude **email address** so you can tell them
+apart. The email is captured from the OAuth token response at login, or looked
+up from Anthropic's profile endpoint (`GET /api/oauth/profile`, the
+`user:profile` scope) when the token response doesn't include it. Accounts that
+predate this feature are labeled automatically the first time they successfully
+serve a request. The email is stored as `email`/`label` in `accounts.json` and
+shown in the debug logs below.
+
 ### Debugging failover
 
 Set `ANTHROPIC_FAILOVER_DEBUG=1` to log candidate selection and failover
 decisions to stderr, e.g.:
 
 ```
-[anthropic-failover] request: 3 candidate account(s) [ 'primary', 'd88cbd5a', 'd5189abb' ]
+[anthropic-failover] request: 3 candidate account(s) [ 'primary', 'alice@example.com', 'bob@example.com' ]
 [anthropic-failover] account primary: stream error → failover
-[anthropic-failover] account d88cbd5a: OK
+[anthropic-failover] account alice@example.com: OK → promoted to primary
 ```
 
 ### Where accounts are stored

@@ -2,6 +2,7 @@ import type { Plugin } from '@opencode-ai/plugin'
 import { AccountStore, computeCooldownUntil } from './accounts.ts'
 import { authorize, exchange } from './auth.ts'
 import { debugLog, inspectStream, isFailoverStatus } from './failover.ts'
+import { fetchAccountProfile } from './profile.ts'
 import { refreshAccessToken } from './refresh.ts'
 import {
   createStrippedStream,
@@ -11,6 +12,35 @@ import {
   rewriteUrl,
   setOAuthHeaders,
 } from './transform.ts'
+
+/**
+ * Add a freshly-authenticated login to the plugin's account store so it joins
+ * automatic failover. The account is labeled by its email: taken from the token
+ * response when present, otherwise resolved from the OAuth profile endpoint.
+ * Best-effort — a store/profile failure must never block a successful login.
+ */
+async function storeLoginAccount(credentials: {
+  refresh: string
+  access: string
+  expires: number
+  email?: string
+}): Promise<void> {
+  try {
+    let email = credentials.email
+    if (!email) {
+      const profile = await fetchAccountProfile(credentials.access)
+      email = profile?.email
+    }
+    new AccountStore().add({
+      refresh: credentials.refresh,
+      access: credentials.access,
+      expires: credentials.expires,
+      email,
+    })
+  } catch {
+    // Never block login on store/profile issues.
+  }
+}
 
 /**
  * Models not yet present in OpenCode's bundled models.dev snapshot that
@@ -98,6 +128,13 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
           const store = new AccountStore()
 
           type Tokens = { access: string; refresh: string; expires: number }
+          type Candidate = {
+            id: string
+            refresh: string
+            access: string
+            expires: number
+            email?: string
+          }
 
           // Per-account inflight refresh promises — prevents concurrent token
           // refreshes for the same account from racing (and causing 401
@@ -185,6 +222,37 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
             }
           }
 
+          // Refresh tokens we've already tried to enrich with an email, so we
+          // don't refetch the profile on every request. Keyed by refresh token
+          // so it works for both store accounts and the primary slot.
+          const enrichAttempted = new Set<string>()
+
+          /**
+           * Best-effort: resolve and store an email label for an account that
+           * doesn't have one yet (e.g. accounts added before emails were
+           * captured). Matched by refresh token so it also labels whichever
+           * account currently occupies OpenCode's primary slot. Uses the
+           * already-valid access token from the just-served request (no extra
+           * refresh). Runs at most once per account per session; never throws.
+           */
+          async function enrichEmail(refresh: string, accessToken: string) {
+            if (!refresh || !accessToken || enrichAttempted.has(refresh)) return
+            enrichAttempted.add(refresh)
+            // Only hit the profile endpoint if there's actually a store account
+            // (without an email yet) that this would label.
+            const target = store.list().find((a) => a.refresh === refresh)
+            if (!target || target.email) return
+            try {
+              const profile = await fetchAccountProfile(accessToken)
+              if (profile?.email) {
+                store.setEmailByRefresh(refresh, profile.email)
+                debugLog(`labeled account → ${profile.email}`)
+              }
+            } catch {
+              // Ignore — labeling is cosmetic.
+            }
+          }
+
           /**
            * Build the ordered list of candidate accounts to try:
            *   1. the primary (OpenCode) account,
@@ -201,33 +269,25 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
             refresh?: string
             access?: string
             expires?: number
-          }): Array<{
-            id: string
-            refresh: string
-            access: string
-            expires: number
-          }> {
-            type Candidate = {
-              id: string
-              refresh: string
-              access: string
-              expires: number
-            }
+          }): Candidate[] {
             const candidates: Candidate[] = []
             const seen = new Set<string>()
 
+            const now = Date.now()
+            const all = store.list()
+
             if (current.refresh) {
+              // If the primary account is also in the store, reuse its email.
+              const known = all.find((a) => a.refresh === current.refresh)
               candidates.push({
                 id: PRIMARY_ID,
                 refresh: current.refresh,
                 access: current.access ?? '',
                 expires: current.expires ?? 0,
+                email: known?.email,
               })
               seen.add(current.refresh)
             }
-
-            const now = Date.now()
-            const all = store.list()
 
             // Tier 2: available store accounts.
             for (const account of all) {
@@ -238,6 +298,7 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                 refresh: account.refresh,
                 access: account.access,
                 expires: account.expires,
+                email: account.email,
               })
               seen.add(account.refresh)
             }
@@ -250,6 +311,7 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                 refresh: account.refresh,
                 access: account.access,
                 expires: account.expires,
+                email: account.email,
               })
               seen.add(account.refresh)
             }
@@ -283,7 +345,9 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
               debugLog(
                 `request: ${candidates.length} candidate account(s)`,
                 candidates.map((c) =>
-                  c.id === PRIMARY_ID ? 'primary' : c.id.slice(0, 8),
+                  c.id === PRIMARY_ID
+                    ? 'primary'
+                    : (c.email ?? c.id.slice(0, 8)),
                 ),
               )
 
@@ -301,7 +365,9 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                 if (!candidate) continue
                 const isLast = i === candidates.length - 1
                 const isPrimary = candidate.id === PRIMARY_ID
-                const tag = isPrimary ? 'primary' : candidate.id.slice(0, 8)
+                const tag = isPrimary
+                  ? 'primary'
+                  : (candidate.email ?? candidate.id.slice(0, 8))
 
                 // 1) Ensure a valid token, refreshing if needed. A refresh
                 // failure (e.g. invalid_grant) is NOT surfaced — we cool the
@@ -405,11 +471,18 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                   } else {
                     debugLog(`account ${tag}: OK`)
                   }
+                  // Backfill an email label for accounts that lack one.
+                  if (!candidate.email) {
+                    void enrichEmail(candidate.refresh, tokens.access)
+                  }
                   return createStrippedStream(rebuilt)
                 }
 
                 // Success with no body.
                 if (!isPrimary) await promoteToPrimary(tokens)
+                if (!candidate.email) {
+                  void enrichEmail(candidate.refresh, tokens.access)
+                }
                 debugLog(`account ${tag}: OK (no body)`)
                 return createStrippedStream(response)
               }
@@ -455,17 +528,9 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                 )
                 // Mirror the login into the plugin-owned account store so it
                 // participates in automatic failover alongside any extra
-                // accounts. Deduped by refresh token.
+                // accounts. Deduped by refresh token; labeled by email.
                 if (credentials.type === 'success') {
-                  try {
-                    new AccountStore().add({
-                      refresh: credentials.refresh,
-                      access: credentials.access,
-                      expires: credentials.expires,
-                    })
-                  } catch {
-                    // Store failure must never block a successful login.
-                  }
+                  await storeLoginAccount(credentials)
                 }
                 return credentials
               },
@@ -490,15 +555,7 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                   result.state,
                 )
                 if (credentials.type === 'success') {
-                  try {
-                    new AccountStore().add({
-                      refresh: credentials.refresh,
-                      access: credentials.access,
-                      expires: credentials.expires,
-                    })
-                  } catch {
-                    // Store failure must never block a successful login.
-                  }
+                  await storeLoginAccount(credentials)
                 }
                 // Returning success also refreshes OpenCode's primary slot to
                 // this account; the store dedupes so no account is used twice.

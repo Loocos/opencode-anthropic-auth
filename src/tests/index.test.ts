@@ -1029,4 +1029,80 @@ describe('multi-account failover', () => {
     expect(response.status).toBe(200)
     expect(servedByCooling).toBe(true)
   })
+
+  test('Claude Pro/Max login labels the stored account by email', async () => {
+    // Token exchange returns an account email; the store should use it.
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              refresh_token: 'login-refresh',
+              access_token: 'login-access',
+              expires_in: 3600,
+              account: { email_address: 'flo@example.com' },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const method = plugin.auth.methods.find(
+      (m: any) => m.label === 'Claude Pro/Max',
+    )
+    const flow = await method.authorize()
+    // Provide a valid code#state matching the generated state.
+    const state = new URL(flow.url).searchParams.get('state')
+    const outcome = await flow.callback(`logincode#${state}`)
+    expect(outcome.type).toBe('success')
+
+    const stored = new AccountStore(storePath).list()
+    expect(stored).toHaveLength(1)
+    expect(stored[0]!.email).toBe('flo@example.com')
+    expect(stored[0]!.label).toBe('flo@example.com')
+  })
+
+  test('login falls back to the profile endpoint when the token has no email', async () => {
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              refresh_token: 'login-refresh',
+              access_token: 'login-access',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      if (url.includes('/api/oauth/profile')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              account: { email_address: 'viaprofile@example.com' },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const method = plugin.auth.methods.find(
+      (m: any) => m.label === 'Claude Pro/Max',
+    )
+    const flow = await method.authorize()
+    const state = new URL(flow.url).searchParams.get('state')
+    await flow.callback(`logincode#${state}`)
+
+    const stored = new AccountStore(storePath).list()
+    expect(stored[0]!.email).toBe('viaprofile@example.com')
+  })
 })

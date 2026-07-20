@@ -3,6 +3,12 @@
 > Forked from [`@ex-machina/opencode-anthropic-auth`](https://github.com/ex-machina-co/opencode-anthropic-auth).
 > Entries below version 1.9.0 are from the upstream project.
 
+## 1.10.0
+
+### Minor Changes
+
+- Label stored accounts by their Claude email address instead of "Account 1/2/3". The email is captured from the OAuth token response at login, or resolved from the `GET /api/oauth/profile` endpoint (the `user:profile` scope) when the token response doesn't include it. Existing accounts are backfilled lazily the first time they successfully serve a request. Emails now appear in the account store (`accounts.json`) and in `ANTHROPIC_FAILOVER_DEBUG` logs, so you can tell which account is which and which one hit a limit.
+
 ## 1.9.2
 
 ### Patch Changes

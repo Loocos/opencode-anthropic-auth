@@ -12,8 +12,10 @@ import { dirname, join } from 'node:path'
 export type Account = {
   /** Stable unique id (used for dedup + as a stable handle). */
   id: string
-  /** Human-friendly label shown in logs/UI (e.g. "Account 1"). */
+  /** Human-friendly label shown in logs/UI (e.g. "Account 1" or the email). */
   label: string
+  /** The account's email address, once resolved from the OAuth profile. */
+  email?: string
   refresh: string
   access: string
   /** Epoch ms when the access token expires. */
@@ -122,6 +124,7 @@ export class AccountStore {
     access: string
     expires: number
     label?: string
+    email?: string
   }): Account {
     const store = readStore(this.path)
 
@@ -132,14 +135,21 @@ export class AccountStore {
       existing.expires = input.expires
       existing.cooldownUntil = 0
       existing.lastError = undefined
-      if (input.label) existing.label = input.label
+      if (input.email) {
+        existing.email = input.email
+        existing.label = input.email
+      } else if (input.label) {
+        existing.label = input.label
+      }
       writeStore(this.path, store)
       return existing
     }
 
     const account: Account = {
       id: crypto.randomUUID(),
-      label: input.label ?? `Account ${store.accounts.length + 1}`,
+      label:
+        input.email ?? input.label ?? `Account ${store.accounts.length + 1}`,
+      email: input.email,
       refresh: input.refresh,
       access: input.access,
       expires: input.expires,
@@ -148,6 +158,36 @@ export class AccountStore {
     store.accounts.push(account)
     writeStore(this.path, store)
     return account
+  }
+
+  /**
+   * Set (or update) an account's email, and use it as the display label.
+   * No-op if the account no longer exists.
+   */
+  setEmail(id: string, email: string): void {
+    if (!email) return
+    const store = readStore(this.path)
+    const account = store.accounts.find((a) => a.id === id)
+    if (!account) return
+    account.email = email
+    account.label = email
+    writeStore(this.path, store)
+  }
+
+  /**
+   * Set an account's email by matching its refresh token, and use it as the
+   * display label. Lets us label the account currently held in OpenCode's
+   * primary slot (which we address by token, not by store id). No-op if no
+   * account matches.
+   */
+  setEmailByRefresh(refresh: string, email: string): void {
+    if (!refresh || !email) return
+    const store = readStore(this.path)
+    const account = store.accounts.find((a) => a.refresh === refresh)
+    if (!account) return
+    account.email = email
+    account.label = email
+    writeStore(this.path, store)
   }
 
   /** Remove an account by id. Returns true if something was removed. */
