@@ -224,6 +224,49 @@ export class AccountStore {
   }
 
   /**
+   * Insert an account ONLY if the pool doesn't already know it, leaving any
+   * existing entry completely untouched. Unlike `add` (an upsert that also
+   * resets the matched account's tokens, cooldown and `lastError`), this never
+   * disturbs a stored account — crucially, it preserves a live cooldown, so it
+   * is safe to call on every request without accidentally reviving a
+   * rate-limited account.
+   *
+   * A match is by email when `input.email` is known, otherwise by refresh
+   * token. Used to persist OpenCode's current credential (the "primary") into
+   * the pool the first time it's seen, so a later login (which overwrites
+   * OpenCode's slot) or a failover promotion (which demotes it) can't silently
+   * drop it. Returns true only when a new account was inserted.
+   */
+  addIfAbsent(input: {
+    refresh: string
+    access: string
+    expires: number
+    email?: string
+  }): boolean {
+    if (!input.refresh) return false
+    const store = readStore(this.path)
+
+    const exists = store.accounts.some((a) => {
+      if (a.refresh === input.refresh) return true
+      if (input.email && a.email === input.email) return true
+      return false
+    })
+    if (exists) return false
+
+    store.accounts.push({
+      id: crypto.randomUUID(),
+      label: input.email ?? `Account ${store.accounts.length + 1}`,
+      email: input.email,
+      refresh: input.refresh,
+      access: input.access,
+      expires: input.expires,
+      cooldownUntil: 0,
+    })
+    writeStore(this.path, store)
+    return true
+  }
+
+  /**
    * Set (or update) an account's email, and use it as the display label. Also
    * collapses any other stored logins of the same Claude account. No-op if the
    * account no longer exists.

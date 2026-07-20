@@ -215,8 +215,12 @@ describe('auth.loader', () => {
     let capturedBody: string | undefined
 
     globalThis.fetch = mock((input: any, init: any) => {
-      capturedHeaders = init?.headers
-      capturedBody = init?.body
+      // Capture only the messages request; the primary is now persisted to the
+      // pool, so a best-effort profile GET also fires to label it — ignore it.
+      if (extractUrl(input).includes('/v1/messages')) {
+        capturedHeaders = init?.headers
+        capturedBody = init?.body
+      }
       return Promise.resolve(new Response(null, { status: 200 }))
     }) as unknown as typeof fetch
 
@@ -423,9 +427,14 @@ describe('auth.loader', () => {
       },
     })
 
-    globalThis.fetch = mock(() =>
-      Promise.resolve(new Response(responseStream, { status: 200 })),
-    ) as unknown as typeof fetch
+    globalThis.fetch = mock((input: any) => {
+      // Return the stream only for the messages call; the primary-labeling
+      // profile GET must not share (and drain) the same ReadableStream.
+      if (extractUrl(input).includes('/v1/messages')) {
+        return Promise.resolve(new Response(responseStream, { status: 200 }))
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
 
     const plugin = await getPlugin()
     const result = await plugin.auth.loader(
@@ -568,7 +577,9 @@ describe('auth.loader', () => {
     let capturedUrl: string | undefined
 
     globalThis.fetch = mock((input: any) => {
-      capturedUrl = extractUrl(input)
+      // Capture only the messages URL, not the primary-labeling profile GET.
+      const url = extractUrl(input)
+      if (url.includes('/v1/messages')) capturedUrl = url
       return Promise.resolve(new Response(null, { status: 200 }))
     }) as unknown as typeof fetch
 
@@ -665,11 +676,12 @@ describe('multi-account failover', () => {
     expect(authHeaders[0]).toContain('primary-access')
     expect(authHeaders[1]).toContain('second-access')
 
-    // The rate-limited account (matched by refresh) should now be cooling down.
-    // Primary isn't in the store, so only the second remains available.
+    // The primary is now persisted to the pool (so it can't be dropped later)
+    // AND cooling down after its 429, so only the second account is available.
     const now = Date.now()
     const available = store.available(now)
     expect(available.map((a) => a.id)).toContain(second.id)
+    expect(available).toHaveLength(1)
   })
 
   test('returns the last error response when all accounts are exhausted', async () => {
@@ -1101,6 +1113,64 @@ describe('multi-account failover', () => {
     const primary = after.find((a) => a.primary)
     expect(primary?.refresh).toBe('primary-refresh')
     expect(after.filter((a) => a.primary)).toHaveLength(1)
+  })
+
+  test('persists a not-yet-stored primary so a later login cannot drop it', async () => {
+    // Reproduces "prior account lost on new login": OpenCode already holds a
+    // credential that was NOT added through this plugin's login (so the pool
+    // doesn't know it). A request must persist it, and a later login with a
+    // DIFFERENT account must keep it rather than overwrite it away.
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              refresh_token: 'login-refresh',
+              access_token: 'login-access',
+              expires_in: 3600,
+              account: { email: 'second@example.com' },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+
+    // 1) A request with the pre-existing primary credential persists it.
+    const result = await plugin.auth.loader(
+      () => Promise.resolve(primaryAuth()),
+      { models: {} },
+    )
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    let stored = new AccountStore(storePath).list()
+    expect(stored).toHaveLength(1)
+    expect(stored[0]!.refresh).toBe('primary-refresh')
+    expect(stored[0]!.primary).toBe(true)
+
+    // 2) Now log in with a DIFFERENT Claude account.
+    const method = plugin.auth.methods.find(
+      (m: any) => m.label === 'Claude Pro/Max',
+    )
+    const flow = await method.authorize()
+    const state = new URL(flow.url).searchParams.get('state')
+    const outcome = await flow.callback(`logincode#${state}`)
+    expect(outcome.type).toBe('success')
+
+    // 3) BOTH accounts survive: the prior primary is preserved and the new
+    // login has become the primary.
+    stored = new AccountStore(storePath).list()
+    expect(stored.map((a) => a.refresh).sort()).toEqual([
+      'login-refresh',
+      'primary-refresh',
+    ])
+    const nowPrimary = stored.find((a) => a.primary)
+    expect(nowPrimary?.refresh).toBe('login-refresh')
+    expect(stored.filter((a) => a.primary)).toHaveLength(1)
   })
 
   test('promotion on failover moves the primary flag to the working account', async () => {

@@ -110,6 +110,68 @@ describe('AccountStore', () => {
     expect(store.list()).toHaveLength(2)
   })
 
+  test('addIfAbsent inserts a new account when none matches', () => {
+    const store = new AccountStore(storePath)
+    expect(
+      store.addIfAbsent({ refresh: 'r1', access: 'a1', expires: 123 }),
+    ).toBe(true)
+    const list = store.list()
+    expect(list).toHaveLength(1)
+    expect(list[0]!.refresh).toBe('r1')
+    expect(list[0]!.cooldownUntil).toBe(0)
+  })
+
+  test('addIfAbsent leaves an existing entry (and its tokens) untouched', () => {
+    const store = new AccountStore(storePath)
+    store.add({ refresh: 'r1', access: 'a1', expires: 1 })
+    // Unlike add()'s upsert, this must NOT overwrite the stored tokens.
+    expect(
+      store.addIfAbsent({ refresh: 'r1', access: 'a2-new', expires: 999 }),
+    ).toBe(false)
+    const list = store.list()
+    expect(list).toHaveLength(1)
+    expect(list[0]!.access).toBe('a1')
+    expect(list[0]!.expires).toBe(1)
+  })
+
+  test('addIfAbsent preserves an existing cooldown (never revives it)', () => {
+    const store = new AccountStore(storePath)
+    const account = store.add({ refresh: 'r1', access: 'a1', expires: 1 })
+    const until = Date.now() + 100_000
+    store.markCooldown(account.id, until, 'HTTP 429')
+    // Re-persisting the same credential must keep the account cooling down.
+    expect(store.addIfAbsent({ refresh: 'r1', access: 'a1', expires: 1 })).toBe(
+      false,
+    )
+    const updated = store.list()[0]!
+    expect(updated.cooldownUntil).toBe(until)
+    expect(updated.lastError).toBe('HTTP 429')
+    expect(store.available()).toHaveLength(0)
+  })
+
+  test('addIfAbsent dedupes by email when the email is known', () => {
+    const store = new AccountStore(storePath)
+    store.add({ refresh: 'r1', access: 'a1', expires: 1, email: 'me@x.com' })
+    // Same account (same email), rotated refresh token → no new entry.
+    expect(
+      store.addIfAbsent({
+        refresh: 'r2-rotated',
+        access: 'a2',
+        expires: 2,
+        email: 'me@x.com',
+      }),
+    ).toBe(false)
+    expect(store.list()).toHaveLength(1)
+  })
+
+  test('addIfAbsent ignores an empty refresh token', () => {
+    const store = new AccountStore(storePath)
+    expect(store.addIfAbsent({ refresh: '', access: 'a', expires: 1 })).toBe(
+      false,
+    )
+    expect(store.list()).toHaveLength(0)
+  })
+
   test('setEmail collapses a newly-discovered duplicate into the existing one', () => {
     const store = new AccountStore(storePath)
     const a = store.add({ refresh: 'r1', access: 'a1', expires: 10 })

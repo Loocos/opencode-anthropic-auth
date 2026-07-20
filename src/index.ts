@@ -18,6 +18,13 @@ import {
  * automatic failover. The account is labeled by its email: taken from the token
  * response when present, otherwise resolved from the OAuth profile endpoint.
  * Best-effort — a store/profile failure must never block a successful login.
+ *
+ * The previously-active account is preserved separately: the request path
+ * persists whatever credential occupies OpenCode's slot into the pool (see
+ * `addIfAbsent` in the loader) before this login can overwrite it. The one
+ * residual gap is a pre-existing credential that was never used for a single
+ * request before this login — the SDK exposes no way to read OpenCode's current
+ * credential here, so such an unused account can't be captured at login time.
  */
 async function storeLoginAccount(credentials: {
   refresh: string
@@ -166,6 +173,10 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
            * the next request starts from a healthy account. This self-heals a
            * dead primary (e.g. `invalid_grant`): after one failover, OpenCode's
            * own credential points at a working account instead of the dead one.
+           *
+           * The account being demoted here isn't lost: the request path already
+           * persisted it into the pool (see `addIfAbsent` above), so it stays
+           * available for future failover once any cooldown lapses.
            */
           async function promoteToPrimary(tokens: Tokens) {
             try {
@@ -302,9 +313,21 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
               const current = await getAuth()
               if (current.type !== 'oauth') return fetch(input, init)
 
-              // Keep the store's `primary` flag pointing at whichever account
-              // OpenCode currently holds (cheap; writes only when it changes).
-              if (current.refresh) store.setPrimaryByRefresh(current.refresh)
+              // Persist OpenCode's current credential into the pool the first
+              // time we see it, THEN flag it primary. Persisting up-front is what
+              // stops the "prior account lost on new login" case: a later login
+              // overwrites OpenCode's slot, and a failover promotion demotes this
+              // account — either way it survives in the pool and keeps taking
+              // part in failover. Insert-only, so an already-stored account (and
+              // its cooldown) is untouched; safe to call on every request.
+              if (current.refresh) {
+                store.addIfAbsent({
+                  refresh: current.refresh,
+                  access: current.access ?? '',
+                  expires: current.expires ?? 0,
+                })
+                store.setPrimaryByRefresh(current.refresh)
+              }
 
               const candidates = buildCandidates(current)
               debugLog(
