@@ -747,6 +747,55 @@ describe('multi-account failover', () => {
     expect(twin!.cooldownUntil ?? 0).toBeGreaterThan(Date.now())
   })
 
+  test('a cooling primary is demoted below healthy accounts (not retried first)', async () => {
+    // When the primary itself is on cooldown but still occupies OpenCode's slot
+    // (e.g. a promotion hasn't taken effect yet), a request must try a HEALTHY
+    // account first rather than wasting a round-trip on the rate-limited primary.
+    const store = new AccountStore(storePath)
+    // The primary is already cooling; a healthy second account is available.
+    const primary = store.add({
+      refresh: 'primary-refresh',
+      access: 'primary-access',
+      expires: Date.now() + 100_000,
+    })
+    store.markCooldown(primary.id, Date.now() + 100_000, 'HTTP 429')
+    store.add({
+      refresh: 'second-refresh',
+      access: 'second-access',
+      expires: Date.now() + 100_000,
+    })
+
+    const authHeaders: string[] = []
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/messages')) {
+        const auth = (init?.headers as Headers).get('authorization') ?? ''
+        authHeaders.push(auth)
+        // The cooling primary is still rate-limited; the second succeeds.
+        if (auth.includes('primary-access')) {
+          return Promise.resolve(new Response('rate limited', { status: 429 }))
+        }
+        return Promise.resolve(new Response(null, { status: 200 }))
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    // OpenCode's slot still holds the (cooling) primary.
+    const result = await plugin.auth.loader(
+      () => Promise.resolve(primaryAuth()),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(response.status).toBe(200)
+
+    // The healthy second account is tried FIRST and the cooling primary is not
+    // hit at all (it is only a last resort, never reached here).
+    expect(authHeaders[0]).toContain('second-access')
+    expect(authHeaders.some((h) => h.includes('primary-access'))).toBe(false)
+  })
+
   test('returns the last error response when all accounts are exhausted', async () => {
     // Primary + one store account, both rate-limited.
     const store = new AccountStore(storePath)

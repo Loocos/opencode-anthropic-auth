@@ -225,9 +225,13 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
 
           /**
            * Build the ordered list of candidate accounts to try:
-           *   1. the primary (OpenCode) account,
+           *   1. the primary (OpenCode) account — UNLESS it is itself cooling
+           *      down, in which case it is demoted to tier 3 so a healthy
+           *      account is tried first instead of wasting a round-trip on the
+           *      rate-limited slot,
            *   2. store accounts that are available (not cooling down),
-           *   3. store accounts that ARE cooling down, as a LAST RESORT.
+           *   3. accounts that ARE cooling down (including the primary when it
+           *      is cooling), as a LAST RESORT.
            *
            * Including cooling accounts (tier 3) is what prevents the session
            * from stalling: even if every account is on cooldown, we still try
@@ -246,15 +250,27 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
             const now = Date.now()
             const all = store.list()
 
-            if (current.refresh) {
-              // If the primary account is also in the store, reuse its email.
-              const known = all.find((a) => a.refresh === current.refresh)
+            // The primary's store twin (persisted up-front by the fetch handler)
+            // carries the cooldown set by markFailover when the primary is
+            // rate-limited. If it's cooling, skip tier 1: leaving `current.refresh`
+            // out of `seen` lets the tier 3 loop surface the twin (by its store
+            // id) as a last resort, after any healthy account — so the primary's
+            // own cooldown is honored instead of being retried first every time.
+            const primaryTwin = current.refresh
+              ? all.find((a) => a.refresh === current.refresh)
+              : undefined
+            const primaryCooling =
+              !!primaryTwin?.cooldownUntil && primaryTwin.cooldownUntil > now
+
+            // Tier 1: the primary account (unless it is itself cooling down).
+            if (current.refresh && !primaryCooling) {
               candidates.push({
                 id: PRIMARY_ID,
                 refresh: current.refresh,
                 access: current.access ?? '',
                 expires: current.expires ?? 0,
-                email: known?.email,
+                // If the primary is also in the store, reuse its email.
+                email: primaryTwin?.email,
               })
               seen.add(current.refresh)
             }
@@ -273,7 +289,8 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
               seen.add(account.refresh)
             }
 
-            // Tier 3: cooling store accounts (last resort).
+            // Tier 3: cooling store accounts (last resort). A cooling primary is
+            // surfaced here via its twin, so a healthy tier-2 account wins over it.
             for (const account of all) {
               if (seen.has(account.refresh)) continue
               candidates.push({
