@@ -141,27 +141,22 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
               }
             }
 
-            let inflight = refreshPromises.get(candidate.id)
+            // Deduplicate by the REFRESH TOKEN, not the candidate id. The same
+            // Claude account can appear both as the primary and as its store
+            // twin (they share a refresh token); keying by token means those
+            // concurrent refreshes share a single request instead of both
+            // spending the same single-use token and one hitting invalid_grant.
+            const key = candidate.refresh
+            let inflight = refreshPromises.get(key)
             if (!inflight) {
               inflight = (async () => {
-                // For the primary, re-read OpenCode's credential just before
-                // refreshing: another in-flight request may have rotated the
-                // refresh token since this request captured its snapshot, and
-                // reusing the stale token would fail with `invalid_grant`.
-                let refresh = candidate.refresh
-                if (candidate.id === PRIMARY_ID) {
-                  const fresh = await getAuth()
-                  if (fresh.type === 'oauth' && fresh.refresh) {
-                    refresh = fresh.refresh
-                  }
-                }
-                const tokens = await refreshAccessToken(refresh)
-                await persistTokens(candidate.id, tokens, refresh)
+                const tokens = await refreshAccessToken(candidate.refresh)
+                await persistTokens(candidate.id, tokens, candidate.refresh)
                 return tokens
               })().finally(() => {
-                refreshPromises.delete(candidate.id)
+                refreshPromises.delete(key)
               })
-              refreshPromises.set(candidate.id, inflight)
+              refreshPromises.set(key, inflight)
             }
             return inflight
           }
@@ -301,23 +296,6 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
             }
           }
 
-          /**
-           * Read a (usually small error) response body into memory and return a
-           * fresh, still-readable Response. Used when we want to keep a failed
-           * response around to surface later without holding an open/cancelled
-           * stream.
-           */
-          async function bufferResponse(response: Response): Promise<Response> {
-            const buf = await response
-              .arrayBuffer()
-              .catch(() => new ArrayBuffer(0))
-            return new Response(buf, {
-              status: response.status,
-              statusText: response.statusText,
-              headers: response.headers,
-            })
-          }
-
           return {
             apiKey: '',
             async fetch(input: string | URL | Request, init?: RequestInit) {
@@ -341,11 +319,11 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
               let body = init?.body
               if (body && typeof body === 'string') {
                 body = rewriteRequestBody(body)
-              } else if (body != null && candidates.length > 1) {
+              } else if (body != null) {
                 // A non-string body (ReadableStream/Blob/BufferSource) can only
-                // be consumed once. When failover is possible we buffer it up
-                // front so each candidate can re-send the same bytes instead of
-                // the first fetch draining it and the retries sending nothing.
+                // be consumed once. Buffer it up front so every failover
+                // candidate re-sends the same bytes instead of the first fetch
+                // draining it and retries sending an empty body.
                 body = new Uint8Array(
                   // biome-ignore lint/suspicious/noExplicitAny: BodyInit is broad
                   await new Response(body as any).arrayBuffer(),
@@ -353,7 +331,6 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
               }
               const rewritten = rewriteUrl(input)
 
-              let lastResponse: Response | undefined
               let lastError: unknown
 
               for (let i = 0; i < candidates.length; i++) {
@@ -421,7 +398,9 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                   }
                 }
 
-                // 3a) Hard failover HTTP status (429/401/403/529).
+                // 3a) Hard failover HTTP status (429/401/403/529). The last
+                // candidate is returned directly (real status + body); earlier
+                // ones are cooled down and we move on.
                 if (isFailoverStatus(response.status)) {
                   markFailover(
                     candidate,
@@ -429,7 +408,6 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                     `HTTP ${response.status}`,
                   )
                   if (isLast) {
-                    // Nothing left to try — surface the real error (body intact).
                     debugLog(
                       `account ${tag}: HTTP ${response.status} (no more accounts)`,
                     )
@@ -438,17 +416,28 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                   debugLog(
                     `account ${tag}: HTTP ${response.status} → next account`,
                   )
-                  lastResponse = await bufferResponse(response)
+                  lastError = new Error(`HTTP ${response.status}`)
+                  await response.body?.cancel().catch(() => {})
                   continue
                 }
 
-                // 3b) A 2xx whose stream carries an error event before any
-                // content (Anthropic returns 200 + an SSE `error` event for
-                // rate/usage limits, sometimes a few events in). Inspect only
-                // when failover is possible at all (more than one candidate) so
-                // the common single-account path streams directly with no added
-                // first-token latency.
-                if (response.ok && response.body && candidates.length > 1) {
+                // 3b) A streaming 2xx whose SSE stream carries an error event
+                // before any content (Anthropic returns 200 + an SSE `error`
+                // event for rate/usage limits, sometimes a few events in).
+                // Inspect only when failover is possible (more than one
+                // candidate) AND the response is actually an event stream — so
+                // the single-account path and non-streaming JSON responses are
+                // forwarded directly with no added latency or buffering.
+                const isEventStream =
+                  response.headers
+                    .get('content-type')
+                    ?.includes('text/event-stream') ?? false
+                if (
+                  response.ok &&
+                  response.body &&
+                  isEventStream &&
+                  candidates.length > 1
+                ) {
                   const { isError, prefixText, stream } = await inspectStream(
                     response.body,
                   )
@@ -465,7 +454,8 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                       'stream error (rate/usage limit)',
                     )
                     if (isLast) {
-                      // No more accounts — surface the error stream as-is.
+                      // No more accounts — surface the error stream as-is so the
+                      // caller sees the genuine rate-limit event.
                       debugLog(
                         `account ${tag}: stream error (no more accounts)`,
                         prefixText.slice(0, 200),
@@ -476,7 +466,8 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                       `account ${tag}: stream error → next account`,
                       prefixText.slice(0, 200),
                     )
-                    lastResponse = await bufferResponse(rebuilt)
+                    lastError = new Error('rate/usage limit (stream error)')
+                    await stream.cancel().catch(() => {})
                     continue
                   }
 
@@ -497,12 +488,9 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                 return createStrippedStream(response)
               }
 
-              // Every candidate failed. Surface the last real API response (so
-              // the user sees the genuine error) or rethrow the last error.
-              if (lastResponse) {
-                debugLog('all candidates exhausted → surfacing last response')
-                return createStrippedStream(lastResponse)
-              }
+              // Reached only when the LAST candidate failed via a refresh or
+              // network exception (every HTTP response is returned inside the
+              // loop). Surface that error rather than a stale/misleading body.
               if (lastError) {
                 debugLog('all candidates exhausted → throwing last error')
                 throw lastError

@@ -24,6 +24,15 @@ beforeAll(() => {
   process.env.ANTHROPIC_ACCOUNTS_PATH = join(globalStoreDir, 'accounts.json')
 })
 
+// Start every test from an empty store and the global path. The loader now
+// persists the current primary into the store on each request, so without this
+// reset one test's account would leak into the next. (The failover describe
+// block overrides the path again with its own per-test temp file.)
+beforeEach(() => {
+  process.env.ANTHROPIC_ACCOUNTS_PATH = join(globalStoreDir, 'accounts.json')
+  rmSync(join(globalStoreDir, 'accounts.json'), { force: true })
+})
+
 afterAll(() => {
   if (originalGlobalAccountsPath === undefined) {
     delete process.env.ANTHROPIC_ACCOUNTS_PATH
@@ -780,7 +789,12 @@ describe('multi-account failover', () => {
               controller.close()
             },
           })
-          return Promise.resolve(new Response(stream, { status: 200 }))
+          return Promise.resolve(
+            new Response(stream, {
+              status: 200,
+              headers: { 'content-type': 'text/event-stream' },
+            }),
+          )
         }
         // Second account: a normal successful stream.
         const ok = new ReadableStream({
@@ -793,7 +807,12 @@ describe('multi-account failover', () => {
             controller.close()
           },
         })
-        return Promise.resolve(new Response(ok, { status: 200 }))
+        return Promise.resolve(
+          new Response(ok, {
+            status: 200,
+            headers: { 'content-type': 'text/event-stream' },
+          }),
+        )
       }
       return Promise.resolve(new Response(null, { status: 200 }))
     }) as unknown as typeof fetch
