@@ -105,6 +105,49 @@ describe('AccountStore', () => {
     store.setEmailByRefresh('missing', 'x@example.com')
   })
 
+  test('setPrimaryByRefresh flags exactly one account', () => {
+    const store = new AccountStore(storePath)
+    store.add({ refresh: 'r1', access: 'a1', expires: 1 })
+    store.add({ refresh: 'r2', access: 'a2', expires: 2 })
+
+    store.setPrimaryByRefresh('r1')
+    expect(store.list().find((a) => a.refresh === 'r1')!.primary).toBe(true)
+    expect(
+      store.list().find((a) => a.refresh === 'r2')!.primary,
+    ).toBeUndefined()
+
+    // Switching primary clears the previous one.
+    store.setPrimaryByRefresh('r2')
+    expect(
+      store.list().find((a) => a.refresh === 'r1')!.primary,
+    ).toBeUndefined()
+    expect(store.list().find((a) => a.refresh === 'r2')!.primary).toBe(true)
+
+    // Exactly one primary at all times.
+    expect(store.list().filter((a) => a.primary)).toHaveLength(1)
+  })
+
+  test('updateTokensByRefresh rotates tokens for the matching account', () => {
+    const store = new AccountStore(storePath)
+    store.add({ refresh: 'old', access: 'a1', expires: 1 })
+    store.updateTokensByRefresh('old', {
+      refresh: 'new',
+      access: 'a2',
+      expires: 2,
+    })
+    const updated = store.list()[0]!
+    expect(updated.refresh).toBe('new')
+    expect(updated.access).toBe('a2')
+    expect(updated.expires).toBe(2)
+    // Unknown refresh is a no-op.
+    store.updateTokensByRefresh('missing', {
+      refresh: 'x',
+      access: 'x',
+      expires: 9,
+    })
+    expect(store.list()[0]!.refresh).toBe('new')
+  })
+
   test('remove deletes an account by id', () => {
     const store = new AccountStore(storePath)
     const account = store.add({ refresh: 'r1', access: 'a1', expires: 1 })

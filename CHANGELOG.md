@@ -3,6 +3,13 @@
 > Forked from [`@ex-machina/opencode-anthropic-auth`](https://github.com/ex-machina-co/opencode-anthropic-auth).
 > Entries below version 1.9.0 are from the upstream project.
 
+## 1.11.0
+
+### Minor Changes
+
+- Remove the separate "Add another Claude account (failover)" entry from the OpenCode auth menu — it's back to the original three options. Failover is now fully transparent: signing in with **Claude Pro/Max** repeatedly (each time with a different Claude account) adds every account to the failover pool automatically.
+- Record which account is currently primary in `accounts.json` via a `primary: true` flag on the single account held in OpenCode's credential slot. The flag follows the active account as it changes (login, failover promotion, token rotation). To keep it accurate, a stored account's tokens are now also kept in sync when OpenCode rotates the primary's refresh token, so a demoted account remains usable.
+
 ## 1.10.0
 
 ### Minor Changes

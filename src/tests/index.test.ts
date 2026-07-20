@@ -112,9 +112,12 @@ describe('AnthropicAuthPlugin', () => {
 })
 
 describe('auth.methods', () => {
-  test('has four auth methods', async () => {
+  test('has three auth methods (no separate failover option)', async () => {
     const plugin = await getPlugin()
-    expect(plugin.auth.methods).toHaveLength(4)
+    expect(plugin.auth.methods).toHaveLength(3)
+    // The failover flow is transparent — there is no dedicated method for it.
+    const labels = plugin.auth.methods.map((m: any) => m.label)
+    expect(labels).not.toContain('Add another Claude account (failover)')
   })
 
   test('first method is Claude Pro/Max OAuth with code flow', async () => {
@@ -125,25 +128,17 @@ describe('auth.methods', () => {
     expect(method.authorize).toBeFunction()
   })
 
-  test('second method adds another Claude account for failover', async () => {
+  test('second method is Create an API Key OAuth with code flow', async () => {
     const plugin = await getPlugin()
     const method = plugin.auth.methods[1]
-    expect(method.label).toBe('Add another Claude account (failover)')
-    expect(method.type).toBe('oauth')
-    expect(method.authorize).toBeFunction()
-  })
-
-  test('third method is Create an API Key OAuth with code flow', async () => {
-    const plugin = await getPlugin()
-    const method = plugin.auth.methods[2]
     expect(method.label).toBe('Create an API Key')
     expect(method.type).toBe('oauth')
     expect(method.authorize).toBeFunction()
   })
 
-  test('fourth method is manual API key', async () => {
+  test('third method is manual API key', async () => {
     const plugin = await getPlugin()
-    const method = plugin.auth.methods[3]
+    const method = plugin.auth.methods[2]
     expect(method.label).toBe('Manually enter API Key')
     expect(method.type).toBe('api')
     expect(method.provider).toBe('anthropic')
@@ -1104,5 +1099,104 @@ describe('multi-account failover', () => {
 
     const stored = new AccountStore(storePath).list()
     expect(stored[0]!.email).toBe('viaprofile@example.com')
+  })
+
+  test('login marks the account as primary in the store', async () => {
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              refresh_token: 'login-refresh',
+              access_token: 'login-access',
+              expires_in: 3600,
+              account: { email: 'primary@example.com' },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const method = plugin.auth.methods.find(
+      (m: any) => m.label === 'Claude Pro/Max',
+    )
+    const flow = await method.authorize()
+    const state = new URL(flow.url).searchParams.get('state')
+    await flow.callback(`logincode#${state}`)
+
+    const stored = new AccountStore(storePath).list()
+    expect(stored).toHaveLength(1)
+    expect(stored[0]!.primary).toBe(true)
+    expect(stored[0]!.email).toBe('primary@example.com')
+  })
+
+  test('a request flags the current OpenCode account as primary', async () => {
+    const store = new AccountStore(storePath)
+    // Two stored accounts; the second matches the OpenCode primary credential.
+    store.add({ refresh: 'other-refresh', access: 'other', expires: 1 })
+    store.add({
+      refresh: 'primary-refresh',
+      access: 'primary-access',
+      expires: Date.now() + 100_000,
+    })
+
+    globalThis.fetch = mock(() =>
+      Promise.resolve(new Response(null, { status: 200 })),
+    ) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () => Promise.resolve(primaryAuth()),
+      { models: {} },
+    )
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    const after = new AccountStore(storePath).list()
+    const primary = after.find((a) => a.primary)
+    expect(primary?.refresh).toBe('primary-refresh')
+    expect(after.filter((a) => a.primary)).toHaveLength(1)
+  })
+
+  test('promotion on failover moves the primary flag to the working account', async () => {
+    const store = new AccountStore(storePath)
+    store.add({
+      refresh: 'second-refresh',
+      access: 'second-access',
+      expires: Date.now() + 100_000,
+    })
+    // The primary credential is also in the store but its refresh is dead.
+    store.add({
+      refresh: 'dead-primary-refresh',
+      access: 'expired-primary-access',
+      expires: Date.now() - 1000,
+    })
+
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ error: 'invalid_grant' }), {
+            status: 400,
+          }),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () => Promise.resolve(expiredPrimaryAuth()),
+      { models: {} },
+    )
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    // The working second account should now be flagged primary.
+    const after = new AccountStore(storePath).list()
+    const primary = after.find((a) => a.primary)
+    expect(primary?.refresh).toBe('second-refresh')
   })
 })

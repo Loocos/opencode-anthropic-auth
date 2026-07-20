@@ -32,16 +32,15 @@ Add the plugin to your OpenCode configuration:
 
 ```json
 {
-  "plugin": ["opencode-anthropic-auth-loocos@1.10.0"]
+  "plugin": ["opencode-anthropic-auth-loocos@1.11.0"]
 }
 ```
 
 ## Authentication Methods
 
-The plugin provides four authentication options:
+The plugin provides three authentication options:
 
 - **Claude Pro/Max** - OAuth flow via `claude.ai` for Pro/Max subscribers. Uses your existing subscription at no additional API cost.
-- **Add another Claude account (failover)** - OAuth flow to register an additional Claude account for automatic failover (see below).
 - **Create an API Key** - OAuth flow via `console.anthropic.com` that creates an API key on your behalf.
 - **Manually enter API Key** - Standard API key entry for users who already have one.
 
@@ -52,10 +51,14 @@ automatically switch between them when one runs out of usage.
 
 ### Adding accounts
 
-1. Sign in normally via **Claude Pro/Max** (this becomes your primary account).
-2. To add more accounts, choose **Add another Claude account (failover)** and
-   complete the OAuth flow while logged into a *different* Claude account. Repeat
-   for as many accounts as you want.
+There is **no separate "add account" option** — failover is transparent. Just
+sign in with **Claude Pro/Max** as many times as you like:
+
+1. Sign in via **Claude Pro/Max** (this becomes your primary account).
+2. To add more accounts, run **Claude Pro/Max** again and log in with a
+   *different* Claude account. Each login is saved to the account pool (deduped
+   by account, labeled by email) and becomes the current primary. Repeat for as
+   many accounts as you want.
 
 ### How failover works
 
@@ -120,15 +123,30 @@ decisions to stderr, e.g.:
 
 ### Where accounts are stored
 
-Additional accounts are stored in a plugin-owned JSON file (mode `0600`):
+Accounts are stored in a plugin-owned JSON file (mode `0600`):
 
 - `$ANTHROPIC_ACCOUNTS_PATH` if set, otherwise
 - `$XDG_DATA_HOME/opencode-anthropic-auth/accounts.json`, otherwise
 - `~/.local/share/opencode-anthropic-auth/accounts.json`
 
+Each entry records the account's `email` (used as its `label`), its OAuth
+tokens, any `cooldownUntil` timestamp, and a `primary: true` flag on the single
+account currently held in OpenCode's credential slot (the one tried first). For
+example:
+
+```json
+{
+  "version": 1,
+  "accounts": [
+    { "id": "…", "label": "alice@example.com", "email": "alice@example.com", "primary": true,  "refresh": "…", "access": "…", "expires": 1788… },
+    { "id": "…", "label": "bob@example.com",   "email": "bob@example.com",                       "refresh": "…", "access": "…", "expires": 1788…, "cooldownUntil": 1788… }
+  ]
+}
+```
+
 To remove an account, delete its entry from that file (or delete the file to
-reset all extra accounts). Your primary account continues to be managed by
-OpenCode's own credential store.
+reset the pool). The account marked `primary` mirrors OpenCode's own credential
+store and updates automatically as accounts rotate.
 
 ## Configuration
 

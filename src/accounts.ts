@@ -21,6 +21,11 @@ export type Account = {
   /** Epoch ms when the access token expires. */
   expires: number
   /**
+   * True for the single account currently held in OpenCode's credential slot
+   * (the one tried first). Exactly one account has this set at a time.
+   */
+  primary?: boolean
+  /**
    * Epoch ms until which this account is skipped for selection because it hit
    * a rate limit / usage limit. `0` (or absent) means available.
    */
@@ -217,6 +222,50 @@ export class AccountStore {
     account.cooldownUntil = 0
     account.lastError = undefined
     writeStore(this.path, store)
+  }
+
+  /**
+   * Persist rotated tokens for the account whose CURRENT refresh token is
+   * `oldRefresh`. Used to keep the stored copy of the primary account in sync
+   * when OpenCode rotates its token (so the account can still be used after it
+   * is later demoted from primary). No-op if nothing matches.
+   */
+  updateTokensByRefresh(
+    oldRefresh: string,
+    tokens: { refresh: string; access: string; expires: number },
+  ): void {
+    if (!oldRefresh) return
+    const store = readStore(this.path)
+    const account = store.accounts.find((a) => a.refresh === oldRefresh)
+    if (!account) return
+    account.refresh = tokens.refresh
+    account.access = tokens.access
+    account.expires = tokens.expires
+    account.cooldownUntil = 0
+    account.lastError = undefined
+    writeStore(this.path, store)
+  }
+
+  /**
+   * Flag the account matching `refresh` as the primary (OpenCode's current
+   * credential) and clear the flag on all others. Writes only when the flags
+   * actually change, so it's cheap to call on every request.
+   */
+  setPrimaryByRefresh(refresh: string): void {
+    if (!refresh) return
+    const store = readStore(this.path)
+    let changed = false
+    for (const account of store.accounts) {
+      const shouldBePrimary = account.refresh === refresh
+      if (shouldBePrimary && account.primary !== true) {
+        account.primary = true
+        changed = true
+      } else if (!shouldBePrimary && account.primary) {
+        account.primary = undefined
+        changed = true
+      }
+    }
+    if (changed) writeStore(this.path, store)
   }
 
   /**

@@ -31,12 +31,15 @@ async function storeLoginAccount(credentials: {
       const profile = await fetchAccountProfile(credentials.access)
       email = profile?.email
     }
-    new AccountStore().add({
+    const store = new AccountStore()
+    store.add({
       refresh: credentials.refresh,
       access: credentials.access,
       expires: credentials.expires,
       email,
     })
+    // OpenCode makes this login its active credential, so mark it primary.
+    store.setPrimaryByRefresh(credentials.refresh)
   } catch {
     // Never block login on store/profile issues.
   }
@@ -150,11 +153,14 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
 
           /**
            * Persist rotated tokens: for the primary account write back to
-           * OpenCode, otherwise update the plugin-owned account store.
+           * OpenCode, otherwise update the plugin-owned account store. For the
+           * primary we ALSO update its stored copy (matched by the pre-rotation
+           * refresh token) so the account stays usable after it's demoted.
            */
           async function persistTokens(
             id: string,
             tokens: { refresh: string; access: string; expires: number },
+            oldRefresh?: string,
           ) {
             if (id === PRIMARY_ID) {
               // biome-ignore lint/suspicious/noExplicitAny: SDK types don't expose auth.set
@@ -162,6 +168,7 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                 path: { id: 'anthropic' },
                 body: { type: 'oauth', ...tokens },
               })
+              if (oldRefresh) store.updateTokensByRefresh(oldRefresh, tokens)
             } else {
               store.updateTokens(id, tokens)
             }
@@ -194,7 +201,7 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
             if (!inflight) {
               inflight = (async () => {
                 const tokens = await refreshAccessToken(candidate.refresh)
-                await persistTokens(candidate.id, tokens)
+                await persistTokens(candidate.id, tokens, candidate.refresh)
                 return tokens
               })().finally(() => {
                 refreshPromises.delete(candidate.id)
@@ -217,6 +224,8 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                 path: { id: 'anthropic' },
                 body: { type: 'oauth', ...tokens },
               })
+              // Reflect the new primary in the store's `primary` flag.
+              store.setPrimaryByRefresh(tokens.refresh)
             } catch {
               // Promotion is best-effort; never break the response over it.
             }
@@ -340,6 +349,10 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
             async fetch(input: string | URL | Request, init?: RequestInit) {
               const current = await getAuth()
               if (current.type !== 'oauth') return fetch(input, init)
+
+              // Keep the store's `primary` flag pointing at whichever account
+              // OpenCode currently holds (cheap; writes only when it changes).
+              if (current.refresh) store.setPrimaryByRefresh(current.refresh)
 
               const candidates = buildCandidates(current)
               debugLog(
@@ -527,38 +540,13 @@ export const AnthropicAuthPlugin: Plugin = async ({ client }) => {
                   result.state,
                 )
                 // Mirror the login into the plugin-owned account store so it
-                // participates in automatic failover alongside any extra
-                // accounts. Deduped by refresh token; labeled by email.
+                // joins automatic failover. Run this method again and log in
+                // with a DIFFERENT Claude account to add more — each login is
+                // stored (deduped by refresh token, labeled by email) and
+                // becomes the current primary account.
                 if (credentials.type === 'success') {
                   await storeLoginAccount(credentials)
                 }
-                return credentials
-              },
-            }
-          },
-        },
-        {
-          label: 'Add another Claude account (failover)',
-          type: 'oauth',
-          authorize: async () => {
-            const result = await authorize('max')
-            return {
-              url: result.url,
-              instructions:
-                'Log in with a DIFFERENT Claude account, then paste the code here:',
-              method: 'code',
-              callback: async (code: string) => {
-                const credentials = await exchange(
-                  code,
-                  result.verifier,
-                  result.redirectUri,
-                  result.state,
-                )
-                if (credentials.type === 'success') {
-                  await storeLoginAccount(credentials)
-                }
-                // Returning success also refreshes OpenCode's primary slot to
-                // this account; the store dedupes so no account is used twice.
                 return credentials
               },
             }
