@@ -3,6 +3,12 @@
 > Forked from [`@ex-machina/opencode-anthropic-auth`](https://github.com/ex-machina-co/opencode-anthropic-auth).
 > Entries below version 1.9.0 are from the upstream project.
 
+## 1.13.0
+
+### Minor Changes
+
+- Add an `anthropic-add-account` CLI (`bun run add-account`) for adding accounts to the failover pool **without interrupting running OpenCode sessions**. Adding an account through OpenCode's built-in Claude Pro/Max login makes OpenCode re-initialize the `anthropic` provider, which stops whatever session is currently generating. The new CLI runs the same OAuth flow but writes only to the plugin's own account store — it never touches OpenCode's credential slot, so active sessions keep working. The added account (deduped by email, not marked primary) is available for failover on the next request.
+
 ## 1.12.0
 
 ### Minor Changes

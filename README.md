@@ -32,7 +32,7 @@ Add the plugin to your OpenCode configuration:
 
 ```json
 {
-  "plugin": ["opencode-anthropic-auth-loocos@1.12.0"]
+  "plugin": ["opencode-anthropic-auth-loocos@1.13.0"]
 }
 ```
 
@@ -51,21 +51,37 @@ automatically switch between them when one runs out of usage.
 
 ### Adding accounts
 
-There is **no separate "add account" option** — failover is transparent. Just
-sign in with **Claude Pro/Max** as many times as you like:
+**First account:** sign in via **Claude Pro/Max** in OpenCode as usual. This
+becomes your primary account.
 
-1. Sign in via **Claude Pro/Max** (this becomes your primary account).
-2. To add more accounts, run **Claude Pro/Max** again and log in with a
-   *different* Claude account. Each login is saved to the account pool (labeled
-   by email) and becomes the current primary. Repeat for as many accounts as
-   you want.
+**Additional accounts:** use the bundled CLI so your running OpenCode sessions
+aren't interrupted (see the warning below):
+
+```bash
+# from the plugin directory
+bun run add-account
+# or, from an npm install
+npx anthropic-add-account
+```
+
+It opens the same OAuth flow, then adds the account **only** to the failover
+pool — it does not change OpenCode's active account, so anything currently
+generating keeps running. The account is available for failover on the very
+next request.
+
+> [!WARNING]
+> Avoid adding accounts through OpenCode's built-in **Claude Pro/Max** login
+> while a session is generating. Completing that login makes OpenCode
+> re-initialize the `anthropic` provider, which **interrupts the active
+> session**. That's OpenCode core behavior — the `add-account` CLI sidesteps it
+> by never touching OpenCode's credential slot.
 
 > [!IMPORTANT]
 > Failover only helps across **distinct** Claude accounts — multiple logins of
 > the *same* account share one usage quota. The plugin deduplicates by email, so
-> re-logging into an account you've already added just refreshes that entry
-> rather than creating a useless duplicate. Make sure you log in with genuinely
-> different Claude accounts.
+> re-adding an account you already have just refreshes that entry rather than
+> creating a useless duplicate. Make sure you add genuinely different Claude
+> accounts.
 
 ### How failover works
 
