@@ -3,6 +3,16 @@
 > Forked from [`@ex-machina/opencode-anthropic-auth`](https://github.com/ex-machina-co/opencode-anthropic-auth).
 > Entries below version 1.9.0 are from the upstream project.
 
+## 1.13.0
+
+### Minor Changes
+
+- Harden multi-account failover reliability (the same work contributed upstream in [ex-machina-co/opencode-anthropic-auth#190](https://github.com/ex-machina-co/opencode-anthropic-auth/pull/190)):
+  - **A previously-active account is no longer dropped on a new login.** OpenCode's active credential is now persisted into the account pool the first time it serves a request, so signing in with another Claude account (which overwrites OpenCode's credential slot) — or a failover promotion — can no longer silently lose the previous account.
+  - **Rate-limit cooldowns now stick for the primary account.** When the primary's token was rotated just before it hit a limit, the cooldown was recorded against the stale (pre-rotation) refresh token and silently dropped, so the exhausted account was retried on every request. The cooldown is now keyed to the current (post-rotation) token.
+  - **A cooling-down primary is no longer retried first.** If the account in OpenCode's slot is itself on cooldown, the plugin now tries a healthy account before it instead of wasting a round-trip on the rate-limited one on every request.
+  - Additional hardening: streaming responses are only inspected when failover is actually possible (more than one account) and the response is an SSE event stream, so the single-account path adds no latency or buffering; concurrent token refreshes are de-duplicated by refresh token to avoid `invalid_grant` cascades under token rotation; and the genuine API error is surfaced once every account is exhausted.
+
 ## 1.12.0
 
 ### Minor Changes

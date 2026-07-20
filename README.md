@@ -32,7 +32,7 @@ Add the plugin to your OpenCode configuration:
 
 ```json
 {
-  "plugin": ["opencode-anthropic-auth-loocos@1.12.0"]
+  "plugin": ["opencode-anthropic-auth-loocos@1.13.0"]
 }
 ```
 

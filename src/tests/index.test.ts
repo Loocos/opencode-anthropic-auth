@@ -24,6 +24,15 @@ beforeAll(() => {
   process.env.ANTHROPIC_ACCOUNTS_PATH = join(globalStoreDir, 'accounts.json')
 })
 
+// Start every test from an empty store and the global path. The loader now
+// persists the current primary into the store on each request, so without this
+// reset one test's account would leak into the next. (The failover describe
+// block overrides the path again with its own per-test temp file.)
+beforeEach(() => {
+  process.env.ANTHROPIC_ACCOUNTS_PATH = join(globalStoreDir, 'accounts.json')
+  rmSync(join(globalStoreDir, 'accounts.json'), { force: true })
+})
+
 afterAll(() => {
   if (originalGlobalAccountsPath === undefined) {
     delete process.env.ANTHROPIC_ACCOUNTS_PATH
@@ -108,6 +117,76 @@ describe('AnthropicAuthPlugin', () => {
     expect(plugin.provider).toBeDefined()
     expect(plugin.provider.id).toBe('anthropic')
     expect(plugin.provider.models).toBeFunction()
+  })
+})
+
+describe('provider hook', () => {
+  test('injects claude-opus-4-7 when not already present', async () => {
+    const plugin = await getPlugin()
+    const result = await plugin.provider.models({ models: {} })
+    expect(result['claude-opus-4-7']).toBeDefined()
+    expect(result['claude-opus-4-7'].id).toBe('claude-opus-4-7')
+    expect(result['claude-opus-4-7'].name).toBe('Claude Opus 4.7')
+    expect(result['claude-opus-4-7'].providerID).toBe('anthropic')
+  })
+
+  test('injected claude-opus-4-7 has correct capabilities', async () => {
+    const plugin = await getPlugin()
+    const result = await plugin.provider.models({ models: {} })
+    const model = result['claude-opus-4-7']
+    expect(model.capabilities.toolcall).toBe(true)
+    expect(model.capabilities.attachment).toBe(true)
+    expect(model.capabilities.reasoning).toBe(true)
+    expect(model.capabilities.input.image).toBe(true)
+    expect(model.capabilities.input.pdf).toBe(true)
+  })
+
+  test('injected claude-opus-4-7 has correct pricing', async () => {
+    const plugin = await getPlugin()
+    const result = await plugin.provider.models({ models: {} })
+    const model = result['claude-opus-4-7']
+    expect(model.cost.input).toBe(5)
+    expect(model.cost.output).toBe(25)
+    expect(model.cost.cache.read).toBe(0.5)
+    expect(model.cost.cache.write).toBe(6.25)
+  })
+
+  test('injected claude-opus-4-7 has correct context limits', async () => {
+    const plugin = await getPlugin()
+    const result = await plugin.provider.models({ models: {} })
+    const model = result['claude-opus-4-7']
+    expect(model.limit.context).toBe(1_000_000)
+    expect(model.limit.output).toBe(128_000)
+  })
+
+  test('preserves existing provider models', async () => {
+    const plugin = await getPlugin()
+    const existingModels = {
+      'claude-opus-4-6': { id: 'claude-opus-4-6', name: 'Claude Opus 4.6' },
+      'claude-sonnet-4-6': {
+        id: 'claude-sonnet-4-6',
+        name: 'Claude Sonnet 4.6',
+      },
+    }
+    const result = await plugin.provider.models({ models: existingModels })
+    expect(result['claude-opus-4-6']).toBeDefined()
+    expect(result['claude-sonnet-4-6']).toBeDefined()
+    expect(result['claude-opus-4-7']).toBeDefined()
+  })
+
+  test('does not overwrite claude-opus-4-7 if already present in provider', async () => {
+    const plugin = await getPlugin()
+    const existing47 = {
+      id: 'claude-opus-4-7',
+      name: 'Existing Opus 4.7',
+      custom: true,
+    }
+    const result = await plugin.provider.models({
+      models: { 'claude-opus-4-7': existing47 },
+    })
+    // Should keep the existing entry, not overwrite it
+    expect((result['claude-opus-4-7'] as any).custom).toBe(true)
+    expect(result['claude-opus-4-7'].name).toBe('Existing Opus 4.7')
   })
 })
 
@@ -213,8 +292,12 @@ describe('auth.loader', () => {
     let capturedBody: string | undefined
 
     globalThis.fetch = mock((input: any, init: any) => {
-      capturedHeaders = init?.headers
-      capturedBody = init?.body
+      // Capture only the messages request; the primary is now persisted to the
+      // pool, so a best-effort profile GET also fires to label it — ignore it.
+      if (extractUrl(input).includes('/v1/messages')) {
+        capturedHeaders = init?.headers
+        capturedBody = init?.body
+      }
       return Promise.resolve(new Response(null, { status: 200 }))
     }) as unknown as typeof fetch
 
@@ -421,9 +504,14 @@ describe('auth.loader', () => {
       },
     })
 
-    globalThis.fetch = mock(() =>
-      Promise.resolve(new Response(responseStream, { status: 200 })),
-    ) as unknown as typeof fetch
+    globalThis.fetch = mock((input: any) => {
+      // Return the stream only for the messages call; the primary-labeling
+      // profile GET must not share (and drain) the same ReadableStream.
+      if (extractUrl(input).includes('/v1/messages')) {
+        return Promise.resolve(new Response(responseStream, { status: 200 }))
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
 
     const plugin = await getPlugin()
     const result = await plugin.auth.loader(
@@ -566,7 +654,9 @@ describe('auth.loader', () => {
     let capturedUrl: string | undefined
 
     globalThis.fetch = mock((input: any) => {
-      capturedUrl = extractUrl(input)
+      // Capture only the messages URL, not the primary-labeling profile GET.
+      const url = extractUrl(input)
+      if (url.includes('/v1/messages')) capturedUrl = url
       return Promise.resolve(new Response(null, { status: 200 }))
     }) as unknown as typeof fetch
 
@@ -588,76 +678,6 @@ describe('auth.loader', () => {
     })
 
     expect(capturedUrl).toContain('beta=true')
-  })
-})
-
-describe('provider hook', () => {
-  test('injects claude-opus-4-7 when not already present', async () => {
-    const plugin = await getPlugin()
-    const result = await plugin.provider.models({ models: {} })
-    expect(result['claude-opus-4-7']).toBeDefined()
-    expect(result['claude-opus-4-7'].id).toBe('claude-opus-4-7')
-    expect(result['claude-opus-4-7'].name).toBe('Claude Opus 4.7')
-    expect(result['claude-opus-4-7'].providerID).toBe('anthropic')
-  })
-
-  test('injected claude-opus-4-7 has correct capabilities', async () => {
-    const plugin = await getPlugin()
-    const result = await plugin.provider.models({ models: {} })
-    const model = result['claude-opus-4-7']
-    expect(model.capabilities.toolcall).toBe(true)
-    expect(model.capabilities.attachment).toBe(true)
-    expect(model.capabilities.reasoning).toBe(true)
-    expect(model.capabilities.input.image).toBe(true)
-    expect(model.capabilities.input.pdf).toBe(true)
-  })
-
-  test('injected claude-opus-4-7 has correct pricing', async () => {
-    const plugin = await getPlugin()
-    const result = await plugin.provider.models({ models: {} })
-    const model = result['claude-opus-4-7']
-    expect(model.cost.input).toBe(5)
-    expect(model.cost.output).toBe(25)
-    expect(model.cost.cache.read).toBe(0.5)
-    expect(model.cost.cache.write).toBe(6.25)
-  })
-
-  test('injected claude-opus-4-7 has correct context limits', async () => {
-    const plugin = await getPlugin()
-    const result = await plugin.provider.models({ models: {} })
-    const model = result['claude-opus-4-7']
-    expect(model.limit.context).toBe(1_000_000)
-    expect(model.limit.output).toBe(128_000)
-  })
-
-  test('preserves existing provider models', async () => {
-    const plugin = await getPlugin()
-    const existingModels = {
-      'claude-opus-4-6': { id: 'claude-opus-4-6', name: 'Claude Opus 4.6' },
-      'claude-sonnet-4-6': {
-        id: 'claude-sonnet-4-6',
-        name: 'Claude Sonnet 4.6',
-      },
-    }
-    const result = await plugin.provider.models({ models: existingModels })
-    expect(result['claude-opus-4-6']).toBeDefined()
-    expect(result['claude-sonnet-4-6']).toBeDefined()
-    expect(result['claude-opus-4-7']).toBeDefined()
-  })
-
-  test('does not overwrite claude-opus-4-7 if already present in provider', async () => {
-    const plugin = await getPlugin()
-    const existing47 = {
-      id: 'claude-opus-4-7',
-      name: 'Existing Opus 4.7',
-      custom: true,
-    }
-    const result = await plugin.provider.models({
-      models: { 'claude-opus-4-7': existing47 },
-    })
-    // Should keep the existing entry, not overwrite it
-    expect((result['claude-opus-4-7'] as any).custom).toBe(true)
-    expect(result['claude-opus-4-7'].name).toBe('Existing Opus 4.7')
   })
 })
 
@@ -733,11 +753,124 @@ describe('multi-account failover', () => {
     expect(authHeaders[0]).toContain('primary-access')
     expect(authHeaders[1]).toContain('second-access')
 
-    // The rate-limited account (matched by refresh) should now be cooling down.
-    // Primary isn't in the store, so only the second remains available.
+    // The primary is now persisted to the pool (so it can't be dropped later)
+    // AND cooling down after its 429, so only the second account is available.
     const now = Date.now()
     const available = store.available(now)
     expect(available.map((a) => a.id)).toContain(second.id)
+    expect(available).toHaveLength(1)
+  })
+
+  test('cools the primary by its POST-rotation token after a refresh then 429', async () => {
+    // Regression: when the primary's token is rotated by ensureFreshTokens and
+    // it THEN hits a 429, the cooldown must be recorded against the NEW refresh
+    // token (which the store twin now holds), not the stale pre-rotation one.
+    // Otherwise the lookup misses, no cooldown is written, and the exhausted
+    // primary is rebuilt as a candidate and retried on every later request.
+    const store = new AccountStore(storePath)
+    store.add({
+      refresh: 'second-refresh',
+      access: 'second-access',
+      expires: Date.now() + 100_000,
+    })
+
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        // The primary's expired token rotates to a brand-new refresh token.
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              refresh_token: 'primary-rotated',
+              access_token: 'primary-new-access',
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      if (url.includes('/v1/messages')) {
+        const auth = (init?.headers as Headers).get('authorization') ?? ''
+        // The freshly-rotated primary is rate-limited; the second succeeds.
+        if (auth.includes('primary-new-access')) {
+          return Promise.resolve(new Response('rate limited', { status: 429 }))
+        }
+        return Promise.resolve(new Response(null, { status: 200 }))
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const result = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'stale-primary-access',
+          refresh: 'primary-refresh',
+          expires: Date.now() - 1000,
+        }),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(response.status).toBe(200)
+
+    // The primary's store twin (now keyed by its rotated refresh) must be
+    // cooling down. With the bug the lookup missed and it stayed available.
+    const twin = new AccountStore(storePath)
+      .list()
+      .find((a) => a.refresh === 'primary-rotated')
+    expect(twin).toBeDefined()
+    expect(twin!.cooldownUntil ?? 0).toBeGreaterThan(Date.now())
+  })
+
+  test('a cooling primary is demoted below healthy accounts (not retried first)', async () => {
+    // When the primary itself is on cooldown but still occupies OpenCode's slot
+    // (e.g. a promotion hasn't taken effect yet), a request must try a HEALTHY
+    // account first rather than wasting a round-trip on the rate-limited primary.
+    const store = new AccountStore(storePath)
+    // The primary is already cooling; a healthy second account is available.
+    const primary = store.add({
+      refresh: 'primary-refresh',
+      access: 'primary-access',
+      expires: Date.now() + 100_000,
+    })
+    store.markCooldown(primary.id, Date.now() + 100_000, 'HTTP 429')
+    store.add({
+      refresh: 'second-refresh',
+      access: 'second-access',
+      expires: Date.now() + 100_000,
+    })
+
+    const authHeaders: string[] = []
+    globalThis.fetch = mock((input: any, init: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/messages')) {
+        const auth = (init?.headers as Headers).get('authorization') ?? ''
+        authHeaders.push(auth)
+        // The cooling primary is still rate-limited; the second succeeds.
+        if (auth.includes('primary-access')) {
+          return Promise.resolve(new Response('rate limited', { status: 429 }))
+        }
+        return Promise.resolve(new Response(null, { status: 200 }))
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    // OpenCode's slot still holds the (cooling) primary.
+    const result = await plugin.auth.loader(
+      () => Promise.resolve(primaryAuth()),
+      { models: {} },
+    )
+
+    const response = await result.fetch(MESSAGES_URL, EMPTY_POST)
+    expect(response.status).toBe(200)
+
+    // The healthy second account is tried FIRST and the cooling primary is not
+    // hit at all (it is only a last resort, never reached here).
+    expect(authHeaders[0]).toContain('second-access')
+    expect(authHeaders.some((h) => h.includes('primary-access'))).toBe(false)
   })
 
   test('returns the last error response when all accounts are exhausted', async () => {
@@ -857,7 +990,12 @@ describe('multi-account failover', () => {
               controller.close()
             },
           })
-          return Promise.resolve(new Response(stream, { status: 200 }))
+          return Promise.resolve(
+            new Response(stream, {
+              status: 200,
+              headers: { 'content-type': 'text/event-stream' },
+            }),
+          )
         }
         // Second account: a normal successful stream.
         const ok = new ReadableStream({
@@ -870,7 +1008,12 @@ describe('multi-account failover', () => {
             controller.close()
           },
         })
-        return Promise.resolve(new Response(ok, { status: 200 }))
+        return Promise.resolve(
+          new Response(ok, {
+            status: 200,
+            headers: { 'content-type': 'text/event-stream' },
+          }),
+        )
       }
       return Promise.resolve(new Response(null, { status: 200 }))
     }) as unknown as typeof fetch
@@ -1159,6 +1302,64 @@ describe('multi-account failover', () => {
     const primary = after.find((a) => a.primary)
     expect(primary?.refresh).toBe('primary-refresh')
     expect(after.filter((a) => a.primary)).toHaveLength(1)
+  })
+
+  test('persists a not-yet-stored primary so a later login cannot drop it', async () => {
+    // Reproduces "prior account lost on new login": OpenCode already holds a
+    // credential that was NOT added through this plugin's login (so the pool
+    // doesn't know it). A request must persist it, and a later login with a
+    // DIFFERENT account must keep it rather than overwrite it away.
+    globalThis.fetch = mock((input: any) => {
+      const url = extractUrl(input)
+      if (url.includes('/v1/oauth/token')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              refresh_token: 'login-refresh',
+              access_token: 'login-access',
+              expires_in: 3600,
+              account: { email: 'second@example.com' },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+
+    // 1) A request with the pre-existing primary credential persists it.
+    const result = await plugin.auth.loader(
+      () => Promise.resolve(primaryAuth()),
+      { models: {} },
+    )
+    await result.fetch(MESSAGES_URL, EMPTY_POST)
+
+    let stored = new AccountStore(storePath).list()
+    expect(stored).toHaveLength(1)
+    expect(stored[0]!.refresh).toBe('primary-refresh')
+    expect(stored[0]!.primary).toBe(true)
+
+    // 2) Now log in with a DIFFERENT Claude account.
+    const method = plugin.auth.methods.find(
+      (m: any) => m.label === 'Claude Pro/Max',
+    )
+    const flow = await method.authorize()
+    const state = new URL(flow.url).searchParams.get('state')
+    const outcome = await flow.callback(`logincode#${state}`)
+    expect(outcome.type).toBe('success')
+
+    // 3) BOTH accounts survive: the prior primary is preserved and the new
+    // login has become the primary.
+    stored = new AccountStore(storePath).list()
+    expect(stored.map((a) => a.refresh).sort()).toEqual([
+      'login-refresh',
+      'primary-refresh',
+    ])
+    const nowPrimary = stored.find((a) => a.primary)
+    expect(nowPrimary?.refresh).toBe('login-refresh')
+    expect(stored.filter((a) => a.primary)).toHaveLength(1)
   })
 
   test('promotion on failover moves the primary flag to the working account', async () => {

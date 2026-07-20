@@ -74,15 +74,22 @@ function readStore(path: string): AccountStoreFile {
   try {
     const parsed = JSON.parse(raw) as Partial<AccountStoreFile>
     if (!parsed || !Array.isArray(parsed.accounts)) return emptyStore()
-    // Filter to well-formed account entries defensively.
-    const accounts = parsed.accounts.filter(
-      (a): a is Account =>
-        !!a &&
-        typeof a.id === 'string' &&
-        typeof a.refresh === 'string' &&
-        typeof a.access === 'string' &&
-        typeof a.expires === 'number',
-    )
+    // Keep well-formed entries and normalize the (required) label so it's
+    // always a string, even for entries written by older/hand-edited stores.
+    const accounts = parsed.accounts
+      .filter(
+        (a): a is Account =>
+          !!a &&
+          typeof a.id === 'string' &&
+          typeof a.refresh === 'string' &&
+          typeof a.access === 'string' &&
+          typeof a.expires === 'number',
+      )
+      .map((a) => ({
+        ...a,
+        label:
+          typeof a.label === 'string' && a.label ? a.label : (a.email ?? a.id),
+      }))
     return { version: 1, accounts }
   } catch {
     // Corrupt JSON → don't crash the plugin; start fresh.
@@ -92,10 +99,10 @@ function readStore(path: string): AccountStoreFile {
 
 function writeStore(path: string, store: AccountStoreFile): void {
   mkdirSync(dirname(path), { recursive: true })
-  const tmp = `${path}.tmp`
+  // Use a per-writer unique temp name so two concurrent writers can't clobber
+  // the same temp file between write and rename.
+  const tmp = `${path}.${process.pid}.${crypto.randomUUID()}.tmp`
   const data = JSON.stringify(store, null, 2)
-  // Write to a temp file then rename for atomicity (avoids torn writes when
-  // multiple OpenCode sessions persist tokens concurrently).
   writeFileSync(tmp, data, { mode: 0o600 })
   // node:fs renameSync is atomic on the same filesystem.
   renameSync(tmp, path)
@@ -139,8 +146,13 @@ function collapseDuplicates(store: AccountStoreFile): boolean {
 /**
  * File-backed store for multiple Claude OAuth accounts.
  *
- * All mutations re-read the file first (merge semantics) so concurrent
- * OpenCode sessions don't clobber each other's account list.
+ * Every mutation re-reads the file immediately before writing (so it operates
+ * on the latest on-disk snapshot) and writes atomically via a unique temp file
+ * + rename. This narrows — but does not fully eliminate — the read-modify-write
+ * window between concurrent OpenCode sessions; there is no cross-process lock,
+ * so a last-writer-wins update is still theoretically possible. In practice
+ * mutations are small and infrequent, and the atomic rename guarantees readers
+ * never observe a partially written file.
  */
 export class AccountStore {
   private readonly path: string
@@ -209,6 +221,49 @@ export class AccountStore {
     collapseDuplicates(store)
     writeStore(this.path, store)
     return account
+  }
+
+  /**
+   * Insert an account ONLY if the pool doesn't already know it, leaving any
+   * existing entry completely untouched. Unlike `add` (an upsert that also
+   * resets the matched account's tokens, cooldown and `lastError`), this never
+   * disturbs a stored account — crucially, it preserves a live cooldown, so it
+   * is safe to call on every request without accidentally reviving a
+   * rate-limited account.
+   *
+   * A match is by email when `input.email` is known, otherwise by refresh
+   * token. Used to persist OpenCode's current credential (the "primary") into
+   * the pool the first time it's seen, so a later login (which overwrites
+   * OpenCode's slot) or a failover promotion (which demotes it) can't silently
+   * drop it. Returns true only when a new account was inserted.
+   */
+  addIfAbsent(input: {
+    refresh: string
+    access: string
+    expires: number
+    email?: string
+  }): boolean {
+    if (!input.refresh) return false
+    const store = readStore(this.path)
+
+    const exists = store.accounts.some((a) => {
+      if (a.refresh === input.refresh) return true
+      if (input.email && a.email === input.email) return true
+      return false
+    })
+    if (exists) return false
+
+    store.accounts.push({
+      id: crypto.randomUUID(),
+      label: input.email ?? `Account ${store.accounts.length + 1}`,
+      email: input.email,
+      refresh: input.refresh,
+      access: input.access,
+      expires: input.expires,
+      cooldownUntil: 0,
+    })
+    writeStore(this.path, store)
+    return true
   }
 
   /**
@@ -337,6 +392,21 @@ export class AccountStore {
   markCooldown(id: string, until: number, reason?: string): void {
     const store = readStore(this.path)
     const account = store.accounts.find((a) => a.id === id)
+    if (!account) return
+    account.cooldownUntil = until
+    if (reason) account.lastError = reason
+    writeStore(this.path, store)
+  }
+
+  /**
+   * Cool down the account matching `refresh`. Used to cool the store entry that
+   * mirrors OpenCode's primary slot (addressed by token, not store id) so a
+   * rate-limited primary is skipped after it's demoted. No-op if none matches.
+   */
+  markCooldownByRefresh(refresh: string, until: number, reason?: string): void {
+    if (!refresh) return
+    const store = readStore(this.path)
+    const account = store.accounts.find((a) => a.refresh === refresh)
     if (!account) return
     account.cooldownUntil = until
     if (reason) account.lastError = reason
