@@ -3,6 +3,12 @@
 > Forked from [`@ex-machina/opencode-anthropic-auth`](https://github.com/ex-machina-co/opencode-anthropic-auth).
 > Entries below version 1.9.0 are from the upstream project.
 
+## 1.12.0
+
+### Minor Changes
+
+- Deduplicate accounts by email. Logging into the **same** Claude account more than once used to create multiple entries (each login has a different refresh token) that all shared one usage quota — so failover between them did nothing. The store now collapses logins of the same account (same email) down to a single entry, keeping the primary (or freshest) one. This happens on login and whenever an account's email is resolved, so the pool reflects your *distinct* Claude accounts.
+
 ## 1.11.0
 
 ### Minor Changes

@@ -102,6 +102,39 @@ function writeStore(path: string, store: AccountStoreFile): void {
 }
 
 /**
+ * Collapse multiple stored logins of the SAME Claude account (same email) down
+ * to a single entry, in place. Multiple token pairs for one account share that
+ * account's usage quota, so keeping them provides no real failover — we keep
+ * just one per email. The kept ("winner") entry is the primary if one is
+ * flagged, otherwise the one with the freshest (latest-expiring) access token.
+ * Accounts without a known email are left untouched (can't be compared).
+ */
+function collapseDuplicates(store: AccountStoreFile): void {
+  const groups = new Map<string, Account[]>()
+  for (const account of store.accounts) {
+    if (!account.email) continue
+    const group = groups.get(account.email)
+    if (group) group.push(account)
+    else groups.set(account.email, [account])
+  }
+
+  const removeIds = new Set<string>()
+  for (const group of groups.values()) {
+    if (group.length <= 1) continue
+    const winner =
+      group.find((a) => a.primary) ??
+      group.reduce((best, a) => (a.expires > best.expires ? a : best))
+    for (const a of group) {
+      if (a.id !== winner.id) removeIds.add(a.id)
+    }
+  }
+
+  if (removeIds.size > 0) {
+    store.accounts = store.accounts.filter((a) => !removeIds.has(a.id))
+  }
+}
+
+/**
  * File-backed store for multiple Claude OAuth accounts.
  *
  * All mutations re-read the file first (merge semantics) so concurrent
@@ -120,9 +153,10 @@ export class AccountStore {
   }
 
   /**
-   * Add or replace an account. Dedupes by refresh token so re-authenticating
-   * the same Claude account updates the existing entry instead of duplicating.
-   * Returns the stored account (with assigned id/label).
+   * Add or replace an account. Dedupes by EMAIL (same Claude account) when the
+   * email is known, otherwise by refresh token, so re-authenticating the same
+   * Claude account updates the existing entry instead of creating a duplicate
+   * that shares the same usage quota. Returns the stored account.
    */
   add(input: {
     refresh: string
@@ -133,7 +167,15 @@ export class AccountStore {
   }): Account {
     const store = readStore(this.path)
 
-    const existing = store.accounts.find((a) => a.refresh === input.refresh)
+    // Same Claude account = same email. Fall back to refresh-token match when
+    // the email isn't known yet.
+    let existing = input.email
+      ? store.accounts.find((a) => a.email === input.email)
+      : undefined
+    if (!existing) {
+      existing = store.accounts.find((a) => a.refresh === input.refresh)
+    }
+
     if (existing) {
       existing.access = input.access
       existing.refresh = input.refresh
@@ -146,6 +188,7 @@ export class AccountStore {
       } else if (input.label) {
         existing.label = input.label
       }
+      collapseDuplicates(store)
       writeStore(this.path, store)
       return existing
     }
@@ -161,13 +204,15 @@ export class AccountStore {
       cooldownUntil: 0,
     }
     store.accounts.push(account)
+    collapseDuplicates(store)
     writeStore(this.path, store)
     return account
   }
 
   /**
-   * Set (or update) an account's email, and use it as the display label.
-   * No-op if the account no longer exists.
+   * Set (or update) an account's email, and use it as the display label. Also
+   * collapses any other stored logins of the same Claude account. No-op if the
+   * account no longer exists.
    */
   setEmail(id: string, email: string): void {
     if (!email) return
@@ -176,14 +221,15 @@ export class AccountStore {
     if (!account) return
     account.email = email
     account.label = email
+    collapseDuplicates(store)
     writeStore(this.path, store)
   }
 
   /**
    * Set an account's email by matching its refresh token, and use it as the
    * display label. Lets us label the account currently held in OpenCode's
-   * primary slot (which we address by token, not by store id). No-op if no
-   * account matches.
+   * primary slot (which we address by token, not by store id). Also collapses
+   * duplicate logins of the same Claude account. No-op if no account matches.
    */
   setEmailByRefresh(refresh: string, email: string): void {
     if (!refresh || !email) return
@@ -192,6 +238,7 @@ export class AccountStore {
     if (!account) return
     account.email = email
     account.label = email
+    collapseDuplicates(store)
     writeStore(this.path, store)
   }
 

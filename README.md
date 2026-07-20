@@ -32,7 +32,7 @@ Add the plugin to your OpenCode configuration:
 
 ```json
 {
-  "plugin": ["opencode-anthropic-auth-loocos@1.11.0"]
+  "plugin": ["opencode-anthropic-auth-loocos@1.12.0"]
 }
 ```
 
@@ -56,9 +56,16 @@ sign in with **Claude Pro/Max** as many times as you like:
 
 1. Sign in via **Claude Pro/Max** (this becomes your primary account).
 2. To add more accounts, run **Claude Pro/Max** again and log in with a
-   *different* Claude account. Each login is saved to the account pool (deduped
-   by account, labeled by email) and becomes the current primary. Repeat for as
-   many accounts as you want.
+   *different* Claude account. Each login is saved to the account pool (labeled
+   by email) and becomes the current primary. Repeat for as many accounts as
+   you want.
+
+> [!IMPORTANT]
+> Failover only helps across **distinct** Claude accounts — multiple logins of
+> the *same* account share one usage quota. The plugin deduplicates by email, so
+> re-logging into an account you've already added just refreshes that entry
+> rather than creating a useless duplicate. Make sure you log in with genuinely
+> different Claude accounts.
 
 ### How failover works
 

@@ -80,6 +80,66 @@ describe('AccountStore', () => {
     expect(updated.label).toBe('me@example.com')
   })
 
+  test('add dedupes by email: re-login with same account, new token → one entry', () => {
+    const store = new AccountStore(storePath)
+    store.add({
+      refresh: 'r1',
+      access: 'a1',
+      expires: 1,
+      email: 'me@example.com',
+    })
+    // Same account logs in again → different refresh token, same email.
+    store.add({
+      refresh: 'r2-new',
+      access: 'a2',
+      expires: 2,
+      email: 'me@example.com',
+    })
+    const list = store.list()
+    expect(list).toHaveLength(1)
+    // The single entry has the newest tokens.
+    expect(list[0]!.refresh).toBe('r2-new')
+    expect(list[0]!.access).toBe('a2')
+    expect(list[0]!.email).toBe('me@example.com')
+  })
+
+  test('add keeps distinct emails as separate accounts', () => {
+    const store = new AccountStore(storePath)
+    store.add({ refresh: 'r1', access: 'a1', expires: 1, email: 'a@x.com' })
+    store.add({ refresh: 'r2', access: 'a2', expires: 2, email: 'b@x.com' })
+    expect(store.list()).toHaveLength(2)
+  })
+
+  test('setEmail collapses a newly-discovered duplicate into the existing one', () => {
+    const store = new AccountStore(storePath)
+    const a = store.add({ refresh: 'r1', access: 'a1', expires: 10 })
+    const b = store.add({ refresh: 'r2', access: 'a2', expires: 20 })
+    // Label a first with the email.
+    store.setEmail(a.id, 'dup@example.com')
+    // Now b turns out to be the SAME account.
+    store.setEmail(b.id, 'dup@example.com')
+    const list = store.list()
+    expect(list).toHaveLength(1)
+    // Freshest (larger expires) wins when neither is primary.
+    expect(list[0]!.expires).toBe(20)
+    expect(list[0]!.email).toBe('dup@example.com')
+  })
+
+  test('collapse keeps the primary account when duplicates exist', () => {
+    const store = new AccountStore(storePath)
+    const a = store.add({ refresh: 'r1', access: 'a1', expires: 100 })
+    const b = store.add({ refresh: 'r2', access: 'a2', expires: 5 })
+    // Mark the OLDER-token account primary.
+    store.setPrimaryByRefresh('r2')
+    store.setEmail(a.id, 'dup@example.com')
+    store.setEmail(b.id, 'dup@example.com')
+    const list = store.list()
+    expect(list).toHaveLength(1)
+    // Primary wins even though its token expires sooner.
+    expect(list[0]!.refresh).toBe('r2')
+    expect(list[0]!.primary).toBe(true)
+  })
+
   test('setEmail updates email + label by id', () => {
     const store = new AccountStore(storePath)
     const account = store.add({ refresh: 'r1', access: 'a1', expires: 1 })
