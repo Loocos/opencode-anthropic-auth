@@ -125,6 +125,29 @@ describe('AccountStore', () => {
     expect(list[0]!.email).toBe('dup@example.com')
   })
 
+  test('dedupe() collapses pre-existing duplicates and reports the count', () => {
+    const store = new AccountStore(storePath)
+    // Two logins of the same account already labeled (e.g. from an older
+    // version that did not dedupe).
+    store.add({ refresh: 'r1', access: 'a1', expires: 10, email: 'x@x.com' })
+    // Bypass add()'s dedupe by writing a second same-email entry via setEmail
+    // on a distinct refresh, simulating legacy data.
+    const b = store.add({ refresh: 'r2', access: 'a2', expires: 20 })
+    // Manually give b the same email WITHOUT collapsing by editing the file.
+    const fs = require('node:fs')
+    const raw = JSON.parse(fs.readFileSync(storePath, 'utf8'))
+    for (const acc of raw.accounts) {
+      if (acc.id === b.id) acc.email = 'x@x.com'
+    }
+    fs.writeFileSync(storePath, JSON.stringify(raw))
+
+    expect(store.list()).toHaveLength(2)
+    const removed = store.dedupe()
+    expect(removed).toBe(1)
+    expect(store.list()).toHaveLength(1)
+    expect(store.dedupe()).toBe(0)
+  })
+
   test('collapse keeps the primary account when duplicates exist', () => {
     const store = new AccountStore(storePath)
     const a = store.add({ refresh: 'r1', access: 'a1', expires: 100 })

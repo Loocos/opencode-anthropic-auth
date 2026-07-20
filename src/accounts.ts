@@ -109,7 +109,7 @@ function writeStore(path: string, store: AccountStoreFile): void {
  * flagged, otherwise the one with the freshest (latest-expiring) access token.
  * Accounts without a known email are left untouched (can't be compared).
  */
-function collapseDuplicates(store: AccountStoreFile): void {
+function collapseDuplicates(store: AccountStoreFile): boolean {
   const groups = new Map<string, Account[]>()
   for (const account of store.accounts) {
     if (!account.email) continue
@@ -131,7 +131,9 @@ function collapseDuplicates(store: AccountStoreFile): void {
 
   if (removeIds.size > 0) {
     store.accounts = store.accounts.filter((a) => !removeIds.has(a.id))
+    return true
   }
+  return false
 }
 
 /**
@@ -250,6 +252,19 @@ export class AccountStore {
     if (store.accounts.length === before) return false
     writeStore(this.path, store)
     return true
+  }
+
+  /**
+   * Collapse any duplicate logins of the same Claude account (same email) into
+   * a single entry. Returns the number of duplicate entries removed.
+   */
+  dedupe(): number {
+    const store = readStore(this.path)
+    const before = store.accounts.length
+    if (collapseDuplicates(store)) {
+      writeStore(this.path, store)
+    }
+    return before - store.accounts.length
   }
 
   /**
